@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Discuz全系列)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.5.0
-// @description  支持恩山等二级目录DZ论坛 + 浮动回复小窗/底部框多点挂载 + 官方接口同步模型 + 429自动负载均衡
+// @version      3.6.0
+// @description  全站支持“回层主 vs 回楼主”智能区分与@前缀保留 + 恩山等DZ小窗多点挂载 + 官方接口同步模型 + 429自动负载均衡
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
@@ -27,6 +27,9 @@
     const DEFAULT_MODEL = 'gemini-2.0-flash';
     const CACHE_TTL = 12 * 3600 * 1000;
 
+    // 记录用户最近一次在页面上点击“回复某层主”时捕获的层主信息
+    let lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
+
     const FALLBACK_MODELS = [
         { id: 'gemini-2.0-flash', label: '⚡ gemini-2.0-flash (主力推荐·每日1500次高额度)', priority: 100 },
         { id: 'gemini-2.5-flash-lite', label: '🚀 gemini-2.5-flash-lite (新一代极速轻量·高额度)', priority: 95 },
@@ -47,6 +50,46 @@
     GM_registerMenuCommand("🔄 2. 立即从官方接口同步最新模型", () => {
         fetchOfficialModels(true, true);
     });
+
+    /**
+     * 全局监听“回复层主”按钮点击事件（适配 V2EX 和 NodeSeek 点击楼层回复按钮的瞬间抓取该层内容）
+     */
+    document.addEventListener('click', (e) => {
+        const target = e.target;
+        if (!target) return;
+
+        // 1. V2EX 点击楼层右侧回复图标 (如 <a href="#;" onclick="replyOne('xxx');"> 或包含 reply 图标的按钮)
+        if (location.hostname.includes('v2ex.com')) {
+            const cell = target.closest('.cell[id^="r_"]');
+            const isReplyAction = target.closest('a[onclick*="replyOne"], img[alt="Reply"]');
+            if (cell && isReplyAction) {
+                const user = cell.querySelector('strong a.dark')?.innerText?.trim() || '';
+                const floorNum = cell.querySelector('.no')?.innerText?.trim() || '';
+                const content = cell.querySelector('.reply_content')?.innerText?.trim() || '';
+                if (content) {
+                    lastClickedFloor = { user, floorNum, content, timestamp: Date.now() };
+                    updateModeBarStatus();
+                }
+            }
+        }
+
+        // 2. NodeSeek 点击某楼层的“回复 / 引用”按钮
+        if (location.hostname.includes('nodeseek.com')) {
+            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post');
+            const btnText = (target.innerText || target.title || '').trim();
+            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"]');
+            if (commentItem && isReplyBtn) {
+                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"]')?.innerText?.trim() || '';
+                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"]');
+                const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
+                const content = commentItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
+                if (content) {
+                    lastClickedFloor = { user, floorNum, content, timestamp: Date.now() };
+                    setTimeout(updateModeBarStatus, 150);
+                }
+            }
+        }
+    }, true);
 
     function annotateModel(modelId) {
         const id = modelId.toLowerCase();
@@ -141,7 +184,6 @@
         return (cached && Array.isArray(cached) && cached.length > 0) ? cached : FALLBACK_MODELS;
     }
 
-    // 同步页面上所有挂载点的下拉框选项（底部回复框 + 弹窗回复小窗）
     function syncAllModelSelects() {
         const models = getAvailableModels();
         let currentSaved = GM_getValue("GEMINI_MODEL", DEFAULT_MODEL);
@@ -163,6 +205,18 @@
         });
     }
 
+    /**
+     * 读取 NodeSeek CodeMirror 编辑器的当前文本内容
+     */
+    function getNodeSeekEditorText() {
+        const cmEl = document.querySelector('.CodeMirror');
+        if (cmEl && cmEl.CodeMirror) {
+            return cmEl.CodeMirror.getValue() || '';
+        }
+        const ta = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
+        return ta ? ta.value : '';
+    }
+
     const siteConfigs = {
         v2ex: {
             match: () => location.hostname.includes('v2ex.com'),
@@ -173,10 +227,51 @@
                 const el = document.querySelector('#reply_content');
                 return el ? [el] : [];
             },
-            fillText: (text, targetEl) => {
+            /**
+             * 检测 V2EX 回复框内是否有 @用户名 #楼层，若存在则反查该层主的原话并保留 @前缀
+             */
+            detectFloorTarget: (targetEl) => {
+                const el = targetEl || document.querySelector('#reply_content');
+                const val = el ? el.value : '';
+                // 匹配开头形如 "@username #12 " 或 "@username "
+                const match = val.match(/^(@([a-zA-Z0-9_-]+)(?:\s+#(\d+))?\s*)/);
+                if (!match) return null;
+
+                const prefix = match[1].trim() + ' ';
+                const username = match[2];
+                const floorNo = match[3];
+                let floorContent = '';
+
+                // 1. 优先根据 #楼层号 精确查找对应楼层 DOM
+                const cells = Array.from(document.querySelectorAll('.cell[id^="r_"]'));
+                if (floorNo) {
+                    const targetCell = cells.find(c => c.querySelector('.no')?.innerText?.trim() === floorNo);
+                    if (targetCell) floorContent = targetCell.querySelector('.reply_content')?.innerText?.trim() || '';
+                }
+                // 2. 其次根据 @用户名 查找该用户在当前页的最近一条回复
+                if (!floorContent && username) {
+                    const userCells = cells.filter(c => c.querySelector('strong a.dark')?.innerText?.trim() === username);
+                    if (userCells.length > 0) {
+                        floorContent = userCells[userCells.length - 1].querySelector('.reply_content')?.innerText?.trim() || '';
+                    }
+                }
+                // 3. 兜底使用点击事件缓存的层主内容
+                if (!floorContent && lastClickedFloor.user === username) {
+                    floorContent = lastClickedFloor.content;
+                }
+
+                return {
+                    isFloorReply: true,
+                    prefixToKeep: prefix,
+                    targetUser: username,
+                    targetFloor: floorNo || '',
+                    targetContent: floorContent || `(用户 @${username} 的发言)`
+                };
+            },
+            fillText: (text, targetEl, prefixToKeep = '') => {
                 const el = targetEl || document.querySelector('#reply_content');
                 if (el) {
-                    el.value = text;
+                    el.value = prefixToKeep + text;
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.focus();
                 }
@@ -192,47 +287,111 @@
                 const el = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
                 return el ? [el] : [];
             },
-            fillText: (text) => {
+            /**
+             * 检测 NodeSeek 编辑器内是否有 @用户名 #楼层 或 > 引用块，自动反查层主发言并保留引用头
+             */
+            detectFloorTarget: () => {
+                const rawVal = getNodeSeekEditorText();
+                if (!rawVal || !rawVal.trim()) return null;
+
+                // 情况A：匹配 NodeSeek 常见的 "@username #12 " 或 "[@username](/space/...) #12"
+                const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
+                // 情况B：匹配 Markdown 引用块 "> 某层主原话\n\n"
+                const quoteLines = rawVal.match(/^((?:>[^\n]*\n)+)\s*/);
+
+                if (!atMatch && !quoteLines) return null;
+
+                let prefix = '';
+                let floorNo = '';
+                let username = '';
+                let floorContent = '';
+
+                if (quoteLines) {
+                    prefix = quoteLines[0].trim() + '\n\n';
+                    floorContent = quoteLines[1].replace(/^>\s*/gm, '').trim();
+                } else if (atMatch) {
+                    prefix = atMatch[1].trim() + ' ';
+                    floorNo = atMatch[2] || '';
+                    const uMatch = atMatch[1].match(/@([^\s#\]]+)/);
+                    username = uMatch ? uMatch[1] : '';
+                }
+
+                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content'));
+
+                // 1. 若有楼层号 (#N)，在 NS 页面中定位对应楼层的发言内容 (0是主楼，#1通常是索引1)
+                if (!floorContent && floorNo) {
+                    const idx = parseInt(floorNo, 10);
+                    // 优先通过带有 #floorNo 的 DOM 容器查找
+                    const floorLink = document.querySelector(`a[href$="#${floorNo}"], a[href*="#post-${floorNo}"]`);
+                    const container = floorLink ? floorLink.closest('.content-item, .comment-item, li, .nsk-post') : null;
+                    if (container) {
+                        floorContent = container.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
+                    }
+                    if (!floorContent && idx > 0 && allArticles[idx]) {
+                        floorContent = allArticles[idx].innerText.trim();
+                    }
+                }
+
+                // 2. 若有用户名，查找页面上该用户的楼层内容
+                if (!floorContent && username) {
+                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item'));
+                    const matchedItem = items.filter(item => item.innerText.includes(username)).pop();
+                    if (matchedItem) {
+                        floorContent = matchedItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
+                    }
+                }
+
+                // 3. 兜底读取刚才点击回复按钮时记录的层主内容
+                if (!floorContent && (Date.now() - lastClickedFloor.timestamp < 120000)) {
+                    floorContent = lastClickedFloor.content;
+                }
+
+                return {
+                    isFloorReply: true,
+                    prefixToKeep: prefix,
+                    targetUser: username || lastClickedFloor.user || '层主',
+                    targetFloor: floorNo || lastClickedFloor.floorNum || '',
+                    targetContent: floorContent || `(层主 @${username} 的发言)`
+                };
+            },
+            fillText: (text, targetEl, prefixToKeep = '') => {
+                const finalOutput = prefixToKeep + text;
                 const cmEl = document.querySelector('.CodeMirror');
                 if (cmEl && cmEl.CodeMirror) {
-                    cmEl.CodeMirror.setValue(text);
+                    cmEl.CodeMirror.setValue(finalOutput);
                     cmEl.CodeMirror.focus();
+                    cmEl.CodeMirror.setCursor(cmEl.CodeMirror.lineCount(), 0);
                     return;
                 }
                 const hiddenTa = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
                 if (hiddenTa) {
                     hiddenTa.focus();
-                    hiddenTa.value = '';
+                    // 若 CodeMirror 实例未直接暴露在 DOM 上，先选中全部已有内容再粘贴替换，确保不重复堆叠
+                    document.execCommand('selectAll', false, null);
                     const dt = new DataTransfer();
-                    dt.setData('text/plain', text);
+                    dt.setData('text/plain', finalOutput);
                     hiddenTa.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
 
                     setTimeout(() => {
                         if (!hiddenTa.value && (!cmEl || !cmEl.innerText.includes(text.slice(0, 5)))) {
-                            hiddenTa.value = text;
+                            hiddenTa.value = finalOutput;
                             hiddenTa.dispatchEvent(new Event('input', { bubbles: true }));
                         }
                     }, 100);
                 }
             },
-            persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区黑话（bd、好鸡、早收、加钱哥、溢价、灵车、分母、吃码等）'
+            persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区黑话（bd、好鸡、早收、富哥、溢价、灵车、分母、吃码等）'
         },
         discuz: {
             match: () => true,
             title: () => document.querySelector('#thread_subject')?.innerText || document.querySelector('h1')?.innerText || document.title,
             content: () => {
-                // 优先读取主楼内容，若在独立回复页则读取引用内容
                 const firstPost = document.querySelector('td[id^="postmessage_"], .t_f, .message');
                 return firstPost ? firstPost.innerText : '';
             },
             replies: () => {
-                // 如果打开了“回复某楼层”的浮动小窗，优先把被回复那一层引用内容抓取进来，实现精准对线/回复！
-                const quoteBlock = document.querySelector('#fwin_reply blockquote, #postform blockquote, .quote blockquote');
-                const quoteText = quoteBlock ? `【当前直接回复的楼层内容：${quoteBlock.innerText.trim()}】 | ` : '';
-                const topReplies = Array.from(document.querySelectorAll('td[id^="postmessage_"], .t_f')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
-                return quoteText + topReplies;
+                return Array.from(document.querySelectorAll('td[id^="postmessage_"], .t_f')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
             },
-            // 同时支持：1.底部快速回复框(#fastpostmessage) 2.弹窗回复小窗(#postmessage) 3.高级模式编辑器(#e_textarea) 4.手机版回复框(#needmessage)
             getMountTargets: () => {
                 const selectors = [
                     '#fastpostmessage',
@@ -248,14 +407,44 @@
                 });
                 return Array.from(uniqueTargets);
             },
-            fillText: (text, targetEl) => {
-                // 兼容 Discuz 高级模式下的可视化 iframe 编辑器 (#e_iframe)
+            /**
+             * 检测 Discuz! 当前点击的按钮是位于底部回复框（回楼主）还是弹窗/引用页（回层主）
+             */
+            detectFloorTarget: (targetEl) => {
+                // 1. 检查是否在弹出小窗 #fwin_reply 中，或者页面表单内存在引用块 blockquote
+                const inPopup = targetEl && targetEl.closest('#fwin_reply');
+                const quoteBlock = (inPopup ? inPopup.querySelector('blockquote') : null) || document.querySelector('#fwin_reply blockquote, #postform blockquote, .quote blockquote');
+                if (quoteBlock && targetEl && targetEl.id !== 'fastpostmessage') {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: '', // DZ 的引用数据在隐藏表单域中，输入框本身无需加前缀
+                        targetUser: '该层主',
+                        targetFloor: '',
+                        targetContent: quoteBlock.innerText.trim()
+                    };
+                }
+                // 2. 检查高级模式或文本框里是否自带 [quote]...[/quote] 标签
+                const val = targetEl ? targetEl.value : '';
+                const bbcodeMatch = val.match(/^(\[quote\][\s\S]*?\[\/quote\]\s*)/i);
+                if (bbcodeMatch) {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: bbcodeMatch[1],
+                        targetUser: '该层主',
+                        targetFloor: '',
+                        targetContent: bbcodeMatch[1].replace(/\[\/?quote\]/gi, '').trim()
+                    };
+                }
+                return null;
+            },
+            fillText: (text, targetEl, prefixToKeep = '') => {
+                const finalOutput = prefixToKeep + text;
                 const eIframe = document.querySelector('#e_iframe');
                 if (targetEl && targetEl.id === 'e_textarea' && eIframe && eIframe.contentDocument && eIframe.contentDocument.body) {
-                    eIframe.contentDocument.body.innerText = text;
+                    eIframe.contentDocument.body.innerText = finalOutput;
                 }
                 if (targetEl) {
-                    targetEl.value = text;
+                    targetEl.value = finalOutput;
                     targetEl.dispatchEvent(new Event('input', { bubbles: true }));
                     targetEl.dispatchEvent(new Event('change', { bubbles: true }));
                     targetEl.focus();
@@ -275,28 +464,40 @@
             label: '🍗 摸鱼黑话 (2~6字)',
             type: 'short',
             maxTokens: 512,
-            rules: `
-1. 这是纯水贴拿积分/思考/鸡腿模式，字数控制在 2~8 个字！
-2. 根据帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、思考一下、老哥稳、帮顶、前排围观、bd、好鸡早收、分母来了、紫薯布丁）。
-3. 严禁加句号，严禁换行，直接输出完整词组，只输出最终回复的那几个字！`
+            rulesForOP: `
+1. 你正在【直接回复楼主（主楼）】，这是纯水贴拿积分/思考/鸡腿模式，字数控制在 2~8 个字！
+2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、思考一下、老哥稳、帮顶、bd、好鸡早收、分母来了）。
+3. 严禁加句号，严禁换行，绝不要包含 @用户名，只输出最终回复的那几个字！`,
+            rulesForFloor: `
+1. 你正在【直接回应某位层主】，字数控制在 2~10 个字！
+2. 针对【你正在直接回应的层主发言】，用极简的一两个词附和、接梗、赞同或调侃他（例如：老哥真相了、确实如此、同感、扎心了、借您吉言、哈哈真实、+1）。
+3. 严禁加句号，严禁换行，绝不要自己输出 @用户名（系统会自动加），只输出回复正文那几个字！`
         },
         {
             label: '💬 简短互动 (40字左右)',
             type: 'medium',
             maxTokens: 1024,
-            rules: `
-1. 针对主楼内容（如果参考中有【当前直接回复的楼层内容】则优先针对该楼层），用一两句自然的大白话发表看法、吐槽、补充经验或互动。
+            rulesForOP: `
+1. 你正在【直接回复楼主（主楼）】，针对主楼内容，用一两句自然的大白话发表看法、吐槽、补充经验或互动。
 2. 字数控制在 25~55 个字左右（约一到两句话），必须把整句话的逻辑和意思表达完整，绝对不能话说到一半断掉！
-3. 语气要像真人坛友日常敲字交流，口语化、接地气，中间可以用逗号分隔，严禁出现“总的来说”、“确实”、“希望”、“首先”等AI客套词。只输出回复正文！`
+3. 语气要像真人坛友日常敲字交流，口语化、接地气，严禁出现“总的来说”、“确实”、“希望”、“首先”等AI客套词。绝不要包含 @用户名，只输出回复正文！`,
+            rulesForFloor: `
+1. 你正在【直接与某位层主对话/对线】！请把注意力 100% 集中在【你正在直接回应的层主发言】上（主楼内容仅作背景参考）。
+2. 顺着这位层主的话进行回应（赞同补充、解答他的疑问、反驳他的观点或顺着吐槽），字数控制在 20~50 个字左右，必须把话完整说完，绝不断句！
+3. 语气要像真人坛友在楼层里直接跟人搭话，自然口语化，严禁在开头自己写 @用户名（系统已自带前缀），只输出纯回复正文！`
         },
         {
             label: '🧐 详细分析 (完整深度回复)',
             type: 'long',
             maxTokens: 2048,
-            rules: `
-1. 针对主楼的问题、方案、教程或分享（若有【当前直接回复的楼层内容】则重点回应对方），给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！
+            rulesForOP: `
+1. 你正在【直接回复楼主（主楼）】，针对主楼的问题、方案、教程或分享，给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！
 2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种死板的AI公文套路。
-3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），如需列举可以用简单的数字 1. 2. 或直接分段叙述。只输出回复正文！`
+3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），只输出回复正文！`,
+            rulesForFloor: `
+1. 你正在【深度回应/解答某位层主的观点或追问】！请重点针对【你正在直接回应的层主发言】展开深度分析、技术探讨、细节补充或有理有据的反驳，结合主楼背景把道理讲透，字数控制在 100~300 字左右，严禁半途截断！
+2. 保持论坛资深技术老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“首先、其次、最后、综上所述”等AI套话，也不要使用 Markdown 加粗符号（**）。
+3. 严禁在开头自己输出 @用户名（系统已保留前缀），只输出纯回复正文！`
         }
     ];
 
@@ -306,7 +507,29 @@
         return siteConfigs.discuz;
     }
 
-    // 支持页面上多个回复框（如底部快速回复框 + 动态弹出的回复小窗）同时挂载按钮栏
+    /**
+     * 实时更新按钮栏右侧的“当前回复模式指示器”（让用户一眼看清当前是【回楼主】还是【回层主 @xxx】）
+     */
+    function updateModeBarStatus() {
+        const site = getCurrentSite();
+        document.querySelectorAll('.gemini-target-badge').forEach(badge => {
+            const targetEl = badge._ boundTarget;
+            const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
+            if (floorInfo && floorInfo.isFloorReply) {
+                const tag = floorInfo.targetFloor ? `#${floorInfo.targetFloor}` : '';
+                badge.innerText = `🎯 当前：回层主 ${floorInfo.targetUser}${tag}`;
+                badge.style.background = '#1e3a2f';
+                badge.style.color = '#6ee7b7';
+                badge.style.borderColor = '#059669';
+            } else {
+                badge.innerText = '📢 当前：回楼主';
+                badge.style.background = '#1e1f22';
+                badge.style.color = '#949ba4';
+                badge.style.borderColor = '#4e5058';
+            }
+        });
+    }
+
     function initButtons() {
         const site = getCurrentSite();
         const targets = site.getMountTargets();
@@ -323,7 +546,16 @@
             bar.className = 'gemini-btn-bar';
             bar.style.cssText = 'margin: 6px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; z-index: 9999; text-align: left;';
 
-            // 1. 创建三档回复按钮（将当前挂载的 target 输入框直接绑定传参，点哪个框上面的按钮就填哪个框）
+            // 0. 创建“回楼主 / 回层主”状态指示标签
+            const badge = document.createElement('span');
+            badge.className = 'gemini-target-badge';
+            badge._boundTarget = target;
+            badge.innerText = '📢 当前：回楼主';
+            badge.title = '当输入框内有 @用户名 #楼层 或在回复小窗中时，自动切换为针对层主发言生成回复';
+            badge.style.cssText = 'padding: 3px 8px; background: #1e1f22; color: #949ba4; border: 1px solid #4e5058; border-radius: 4px; font-size: 12px; line-height: 1.4; user-select: none;';
+            bar.appendChild(badge);
+
+            // 1. 创建三档回复按钮
             replyModes.forEach(mode => {
                 const btn = document.createElement('button');
                 btn.type = 'button';
@@ -344,7 +576,7 @@
             const modelSelect = document.createElement('select');
             modelSelect.className = 'gemini-model-select';
             modelSelect.title = '选择 Gemini 模型（列表通过官方 API 自动更新，支持额度耗尽自动切换）';
-            modelSelect.style.cssText = 'padding: 3px 6px; background: #1e1f22; color: #b5bac1; border: 1px solid #4e5058; border-radius: 4px; font-size: 12px; height: 26px; cursor: pointer; outline: none; max-width: 260px;';
+            modelSelect.style.cssText = 'padding: 3px 6px; background: #1e1f22; color: #b5bac1; border: 1px solid #4e5058; border-radius: 4px; font-size: 12px; height: 26px; cursor: pointer; outline: none; max-width: 250px;';
             modelSelect.onchange = () => {
                 GM_setValue("GEMINI_MODEL", modelSelect.value);
                 syncAllModelSelects();
@@ -365,7 +597,6 @@
             };
             bar.appendChild(refreshBtn);
 
-            // 将按钮栏插入到目标输入框正上方
             target.parentNode.insertBefore(bar, target);
         });
 
@@ -373,10 +604,13 @@
             syncAllModelSelects();
             fetchOfficialModels(false, false);
         }
+        updateModeBarStatus();
     }
 
     function cleanOutput(text, type) {
         let cleaned = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+        // 防止 AI 自己又重复写了一遍 @username 开头
+        cleaned = cleaned.replace(/^@[a-zA-Z0-9_\u4e00-\u9fa5-]+(?:\s+#\d+)?[,，:：\s]+/, '');
         if (type === 'short') {
             cleaned = cleaned.replace(/[。！!~～]+$/g, '').replace(/\n+/g, ' ');
         } else if (type === 'medium') {
@@ -409,14 +643,38 @@
         const title = site.title() || '无标题';
         const contentLimit = mode.type === 'long' ? 2500 : 1000;
         const content = (site.content() || '无正文内容').slice(0, contentLimit);
-        const replies = (site.replies() || '暂无回复').slice(0, 600);
+        const replies = (site.replies() || '暂无回复').slice(0, 500);
         const personaText = typeof site.persona === 'function' ? site.persona() : site.persona;
 
-        const fullPrompt = `你现在的身份是：${personaText}。\n请根据以下论坛帖子内容生成一条自然回帖，严格遵守以下规则：${mode.rules}\n\n【帖子标题】：${title}\n【主楼内容】：${content}\n【前排或被回复楼层参考】：${replies}`;
+        // 核心逻辑：检测当前是“回复层主”还是“回复楼主”
+        const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
+        let fullPrompt = '';
+        let prefixToKeep = '';
+
+        if (floorInfo && floorInfo.isFloorReply) {
+            prefixToKeep = floorInfo.prefixToKeep || '';
+            fullPrompt = `你现在的身份是：${personaText}。
+注意：你现在【不是在回复楼主】，而是在楼层中【直接回应层主 ${floorInfo.targetUser} ${floorInfo.targetFloor ? '(' + floorInfo.targetFloor + '楼)' : ''}】！
+请严格遵守以下规则：${mode.rulesForFloor}
+
+【你正在直接回应的层主发言（核心焦点，请直接针对这句话进行回复）】：
+"${floorInfo.targetContent}"
+
+【原帖背景参考（仅作上下文了解，切勿跑题去回楼主）】：
+帖子标题：${title}
+主楼摘要：${content.slice(0, 500)}`;
+        } else {
+            fullPrompt = `你现在的身份是：${personaText}。
+你现在正在【直接回复楼主（主楼）】。请根据以下论坛帖子内容生成一条自然回帖，严格遵守以下规则：${mode.rulesForOP}
+
+【帖子标题】：${title}
+【主楼内容】：${content}
+【前排网友回复队形参考】：${replies}`;
+        }
 
         if (triedModels.size === 1) {
             btn.dataset.origText = btn.innerText;
-            btn.innerText = '⏳ 思考中...';
+            btn.innerText = floorInfo?.isFloorReply ? '⏳ 回层主中...' : '⏳ 思考中...';
         } else {
             btn.innerText = `🔄 负载至 ${modelId.replace('gemini-', '')}...`;
         }
@@ -495,7 +753,8 @@
                     }
 
                     replyText = cleanOutput(replyText, mode.type);
-                    site.fillText(replyText, targetEl);
+                    site.fillText(replyText, targetEl, prefixToKeep);
+                    updateModeBarStatus();
                 } catch (e) {
                     btn.innerText = btn.dataset.origText;
                     btn.disabled = false;
@@ -511,6 +770,5 @@
         });
     }
 
-    // 每 800ms 巡检一次页面，一旦用户点开了 DZ 的“回复小窗”，立即在弹窗内挂载按钮栏
     setInterval(initButtons, 800);
 })();
