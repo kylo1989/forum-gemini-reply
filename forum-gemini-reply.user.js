@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Discuz)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.1.0
-// @description  三档回复梯度：摸鱼黑话 / 40字短评 / 深度完整分析，修复断句问题，完美适配NS站CodeMirror与V2EX/DZ
+// @version      3.2.0
+// @description  三档回复梯度：摸鱼黑话 / 40字短评 / 深度完整分析，解除安全拦截与断句问题，完美适配NS站/V2EX/DZ
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
@@ -30,7 +30,7 @@
     const siteConfigs = {
         v2ex: {
             match: () => location.hostname.includes('v2ex.com'),
-            title: () => document.querySelector('.header h1')?.innerText || '',
+            title: () => document.querySelector('.header h1')?.innerText || document.title,
             content: () => document.querySelector('.topic_content')?.innerText || '',
             replies: () => Array.from(document.querySelectorAll('.reply_content')).slice(0, 5).map(el => el.innerText.trim()).join(' | '),
             getMountTarget: () => document.querySelector('#reply_content'),
@@ -51,7 +51,7 @@
             replies: () => Array.from(document.querySelectorAll('article.post-content, .post-content')).slice(1, 6).map(el => el.innerText.trim()).join(' | '),
             getMountTarget: () => document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea'),
             fillText: (text) => {
-                // 方案1：直接通过 CodeMirror 实例写入
+                // 方案1：直接通过页面上下文或 DOM 上的 CodeMirror 实例写入
                 const cmEl = document.querySelector('.CodeMirror');
                 if (cmEl && cmEl.CodeMirror) {
                     cmEl.CodeMirror.setValue(text);
@@ -95,34 +95,33 @@
         }
     };
 
-    // 三档按钮独立配置（给足 maxTokens 防止 Gemini 2.5 思考过程占满额度导致断句）
     const replyModes = [
         {
             label: '🍗 摸鱼黑话 (2~6字)',
             type: 'short',
-            maxTokens: 1024,
+            maxTokens: 512,
             rules: `
 1. 这是纯水贴拿积分/鸡腿模式，字数控制在 2~8 个字！
 2. 根据帖子类型（出鸡/收鸡/抽奖/分享/水贴）和【前排网友回复】的队形，直接甩出最地道的社区极简黑话（例如：bd、绑定、好鸡早收、分母来了、感谢分享、老哥稳、富哥、帮顶）。
-3. 严禁加句号，严禁换行，直接输出完整词组，绝对不要断句！`
+3. 严禁加句号，严禁换行，直接输出完整词组，只输出最终回复的那几个字！`
         },
         {
             label: '💬 简短互动 (40字左右)',
             type: 'medium',
-            maxTokens: 2048,
+            maxTokens: 1024,
             rules: `
 1. 针对主楼内容或顺着前排评论，用一两句自然的大白话发表看法、吐槽、补充经验或互动。
 2. 字数控制在 25~55 个字左右（约一到两句话），必须把整句话的逻辑和意思表达完整，绝对不能话说到一半断掉！
-3. 语气要像真人坛友日常敲字交流，口语化、接地气，中间可以用逗号分隔，严禁出现“总的来说”、“确实”、“希望”、“首先”等AI客套词。`
+3. 语气要像真人坛友日常敲字交流，口语化、接地气，中间可以用逗号分隔，严禁出现“总的来说”、“确实”、“希望”、“首先”等AI客套词。只输出回复正文！`
         },
         {
             label: '🧐 详细分析 (完整深度回复)',
             type: 'long',
-            maxTokens: 4096,
+            maxTokens: 2048,
             rules: `
 1. 针对主楼的问题、方案、测评或分享，给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！
 2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种死板的AI公文套路。
-3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），如需列举可以用简单的数字 1. 2. 或直接分段叙述。`
+3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），如需列举可以用简单的数字 1. 2. 或直接分段叙述。只输出回复正文！`
         }
     ];
 
@@ -158,13 +157,10 @@
     function cleanOutput(text, type) {
         let cleaned = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
         if (type === 'short') {
-            // 摸鱼模式：单行，去除末尾句号和感叹号
             cleaned = cleaned.replace(/[。！!~～]+$/g, '').replace(/\n+/g, ' ');
         } else if (type === 'medium') {
-            // 40字短评模式：合并为单段，保留中间标点，仅去掉最末尾的句号显得更自然
             cleaned = cleaned.replace(/\n+/g, ' ').replace(/\*\*/g, '').replace(/[。]+$/g, '');
         } else {
-            // 详细分析模式：保留完整段落和标点，仅清除容易露馅的 Markdown 符号
             cleaned = cleaned.replace(/\*\*/g, '').replace(/^#+\s*/gm, '');
         }
         return cleaned.trim();
@@ -177,14 +173,13 @@
             return;
         }
 
-        const title = site.title();
-        // 详细分析模式抓取 2500 字上下文，40字模式抓取 1000 字
+        const title = site.title() || '无标题';
         const contentLimit = mode.type === 'long' ? 2500 : 1000;
-        const content = site.content().slice(0, contentLimit);
-        const replies = site.replies().slice(0, 500);
+        const content = (site.content() || '无正文内容').slice(0, contentLimit);
+        const replies = (site.replies() || '暂无回复').slice(0, 500);
 
-        const systemInstruction = `你现在的身份是：${site.persona}。\n请根据帖子内容生成回帖，严格遵守以下规则：${mode.rules}`;
-        const userContent = `【帖子标题】：${title}\n【主楼内容】：${content}\n【前排网友回复参考】：${replies || '暂无回复'}`;
+        // 将系统设定与帖子内容合并为单一 Prompt，最大化兼容所有 API 节点
+        const fullPrompt = `你现在的身份是：${site.persona}。\n请根据以下论坛帖子内容生成一条自然回帖，严格遵守以下规则：${mode.rules}\n\n【帖子标题】：${title}\n【主楼内容】：${content}\n【前排网友回复参考】：${replies}`;
 
         const originalText = btn.innerText;
         btn.innerText = '⏳ 思考中...';
@@ -195,11 +190,21 @@
             url: `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
             headers: { "Content-Type": "application/json" },
             data: JSON.stringify({
-                systemInstruction: { parts: [{ text: systemInstruction }] },
-                contents: [{ parts: [{ text: userContent }] }],
+                contents: [{ parts: [{ text: fullPrompt }] }],
+                // 关闭安全过滤，防止 NS 站专业名词或黑话触发拦截导致返回空数据
+                safetySettings: [
+                    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+                ],
                 generationConfig: {
                     temperature: mode.type === 'long' ? 0.75 : 0.85,
-                    maxOutputTokens: mode.maxTokens
+                    maxOutputTokens: mode.maxTokens,
+                    // 关闭 Gemini 2.5 默认思考消耗，防止思考占满 Token 导致正文断句或 parts 结构偏移
+                    thinkingConfig: {
+                        thinkingBudget: 0
+                    }
                 }
             }),
             onload: function(response) {
@@ -207,17 +212,47 @@
                 btn.disabled = false;
                 try {
                     const data = JSON.parse(response.responseText);
-                    if (!data.candidates || !data.candidates[0]?.content?.parts?.[0]?.text) {
-                        console.error("Gemini Unexpected Response:", data);
-                        alert("返回数据异常，请按 F12 查看控制台详情。");
+
+                    // 1. 检查是否返回了明确的 API 错误（如 Key 失效、429 频率限制、地区不支持等）
+                    if (data.error) {
+                        console.error("Gemini API Error:", data.error);
+                        alert(`Gemini API 报错 (${data.error.code}):\n${data.error.message}`);
                         return;
                     }
-                    let replyText = data.candidates[0].content.parts[0].text;
+
+                    // 2. 检查是否被安全策略拦截
+                    if (data.promptFeedback && data.promptFeedback.blockReason) {
+                        alert(`内容被 Gemini 拦截，原因: ${data.promptFeedback.blockReason}`);
+                        return;
+                    }
+
+                    const candidate = data.candidates && data.candidates[0];
+                    if (!candidate) {
+                        console.error("Gemini Empty Candidate:", data);
+                        alert("未生成有效内容，请检查帖子内容是否空白。");
+                        return;
+                    }
+
+                    // 3. 兼容包含 thought 的多段 parts，提取真正的正文文本
+                    const parts = candidate.content && candidate.content.parts;
+                    if (!parts || parts.length === 0) {
+                        alert(`生成中止，原因: ${candidate.finishReason || 'UNKNOWN'}`);
+                        return;
+                    }
+
+                    const textPart = parts.filter(p => !p.thought && p.text).pop() || parts[parts.length - 1];
+                    let replyText = textPart ? textPart.text : '';
+
+                    if (!replyText) {
+                        alert("生成的回复文本为空，请重试。");
+                        return;
+                    }
+
                     replyText = cleanOutput(replyText, mode.type);
                     site.fillText(replyText);
                 } catch (e) {
-                    console.error("Gemini Error:", response.responseText);
-                    alert("生成失败，请按 F12 查看控制台报错。");
+                    console.error("Parse Error:", e, response.responseText);
+                    alert("解析响应失败，请检查网络代理是否正常。");
                 }
             },
             onerror: function() {
