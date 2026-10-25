@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Discuz全系列)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.6.0
+// @version      3.6.1
 // @description  全站支持“回层主 vs 回楼主”智能区分与@前缀保留 + 恩山等DZ小窗多点挂载 + 官方接口同步模型 + 429自动负载均衡
 // @author       kylo1989
 // @license      MIT
@@ -58,7 +58,7 @@
         const target = e.target;
         if (!target) return;
 
-        // 1. V2EX 点击楼层右侧回复图标 (如 <a href="#;" onclick="replyOne('xxx');"> 或包含 reply 图标的按钮)
+        // 1. V2EX 点击楼层右侧回复图标
         if (location.hostname.includes('v2ex.com')) {
             const cell = target.closest('.cell[id^="r_"]');
             const isReplyAction = target.closest('a[onclick*="replyOne"], img[alt="Reply"]');
@@ -67,8 +67,8 @@
                 const floorNum = cell.querySelector('.no')?.innerText?.trim() || '';
                 const content = cell.querySelector('.reply_content')?.innerText?.trim() || '';
                 if (content) {
-                    lastClickedFloor = { user, floorNum, content, timestamp: Date.now() };
-                    updateModeBarStatus();
+                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
+                    setTimeout(updateModeBarStatus, 100);
                 }
             }
         }
@@ -84,7 +84,7 @@
                 const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
                 const content = commentItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
                 if (content) {
-                    lastClickedFloor = { user, floorNum, content, timestamp: Date.now() };
+                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
                     setTimeout(updateModeBarStatus, 150);
                 }
             }
@@ -213,6 +213,11 @@
         if (cmEl && cmEl.CodeMirror) {
             return cmEl.CodeMirror.getValue() || '';
         }
+        // 若 CodeMirror 实例未挂载到 DOM 属性，读取可视代码行文本
+        const codeLines = document.querySelectorAll('.CodeMirror-code .CodeMirror-line');
+        if (codeLines && codeLines.length > 0) {
+            return Array.from(codeLines).map(line => line.innerText.replace(/\u200B/g, '')).join('\n');
+        }
         const ta = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
         return ta ? ta.value : '';
     }
@@ -227,13 +232,9 @@
                 const el = document.querySelector('#reply_content');
                 return el ? [el] : [];
             },
-            /**
-             * 检测 V2EX 回复框内是否有 @用户名 #楼层，若存在则反查该层主的原话并保留 @前缀
-             */
             detectFloorTarget: (targetEl) => {
                 const el = targetEl || document.querySelector('#reply_content');
                 const val = el ? el.value : '';
-                // 匹配开头形如 "@username #12 " 或 "@username "
                 const match = val.match(/^(@([a-zA-Z0-9_-]+)(?:\s+#(\d+))?\s*)/);
                 if (!match) return null;
 
@@ -242,20 +243,17 @@
                 const floorNo = match[3];
                 let floorContent = '';
 
-                // 1. 优先根据 #楼层号 精确查找对应楼层 DOM
                 const cells = Array.from(document.querySelectorAll('.cell[id^="r_"]'));
                 if (floorNo) {
                     const targetCell = cells.find(c => c.querySelector('.no')?.innerText?.trim() === floorNo);
                     if (targetCell) floorContent = targetCell.querySelector('.reply_content')?.innerText?.trim() || '';
                 }
-                // 2. 其次根据 @用户名 查找该用户在当前页的最近一条回复
                 if (!floorContent && username) {
                     const userCells = cells.filter(c => c.querySelector('strong a.dark')?.innerText?.trim() === username);
                     if (userCells.length > 0) {
                         floorContent = userCells[userCells.length - 1].querySelector('.reply_content')?.innerText?.trim() || '';
                     }
                 }
-                // 3. 兜底使用点击事件缓存的层主内容
                 if (!floorContent && lastClickedFloor.user === username) {
                     floorContent = lastClickedFloor.content;
                 }
@@ -287,17 +285,14 @@
                 const el = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
                 return el ? [el] : [];
             },
-            /**
-             * 检测 NodeSeek 编辑器内是否有 @用户名 #楼层 或 > 引用块，自动反查层主发言并保留引用头
-             */
             detectFloorTarget: () => {
                 const rawVal = getNodeSeekEditorText();
                 if (!rawVal || !rawVal.trim()) return null;
 
-                // 情况A：匹配 NodeSeek 常见的 "@username #12 " 或 "[@username](/space/...) #12"
+                // 匹配 "@username #12 " 或 "[@username](/space/...) #12"
                 const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
-                // 情况B：匹配 Markdown 引用块 "> 某层主原话\n\n"
-                const quoteLines = rawVal.match(/^((?:>[^\n]*\n)+)\s*/);
+                // 匹配 Markdown 引用块 "> 某层主原话"
+                const quoteLines = rawVal.match(/^((?:>[^\n]*\n?)+)\s*/);
 
                 if (!atMatch && !quoteLines) return null;
 
@@ -318,10 +313,8 @@
 
                 const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content'));
 
-                // 1. 若有楼层号 (#N)，在 NS 页面中定位对应楼层的发言内容 (0是主楼，#1通常是索引1)
                 if (!floorContent && floorNo) {
                     const idx = parseInt(floorNo, 10);
-                    // 优先通过带有 #floorNo 的 DOM 容器查找
                     const floorLink = document.querySelector(`a[href$="#${floorNo}"], a[href*="#post-${floorNo}"]`);
                     const container = floorLink ? floorLink.closest('.content-item, .comment-item, li, .nsk-post') : null;
                     if (container) {
@@ -332,7 +325,6 @@
                     }
                 }
 
-                // 2. 若有用户名，查找页面上该用户的楼层内容
                 if (!floorContent && username) {
                     const items = Array.from(document.querySelectorAll('.content-item, .comment-item'));
                     const matchedItem = items.filter(item => item.innerText.includes(username)).pop();
@@ -341,7 +333,6 @@
                     }
                 }
 
-                // 3. 兜底读取刚才点击回复按钮时记录的层主内容
                 if (!floorContent && (Date.now() - lastClickedFloor.timestamp < 120000)) {
                     floorContent = lastClickedFloor.content;
                 }
@@ -366,7 +357,6 @@
                 const hiddenTa = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
                 if (hiddenTa) {
                     hiddenTa.focus();
-                    // 若 CodeMirror 实例未直接暴露在 DOM 上，先选中全部已有内容再粘贴替换，确保不重复堆叠
                     document.execCommand('selectAll', false, null);
                     const dt = new DataTransfer();
                     dt.setData('text/plain', finalOutput);
@@ -407,23 +397,18 @@
                 });
                 return Array.from(uniqueTargets);
             },
-            /**
-             * 检测 Discuz! 当前点击的按钮是位于底部回复框（回楼主）还是弹窗/引用页（回层主）
-             */
             detectFloorTarget: (targetEl) => {
-                // 1. 检查是否在弹出小窗 #fwin_reply 中，或者页面表单内存在引用块 blockquote
                 const inPopup = targetEl && targetEl.closest('#fwin_reply');
                 const quoteBlock = (inPopup ? inPopup.querySelector('blockquote') : null) || document.querySelector('#fwin_reply blockquote, #postform blockquote, .quote blockquote');
                 if (quoteBlock && targetEl && targetEl.id !== 'fastpostmessage') {
                     return {
                         isFloorReply: true,
-                        prefixToKeep: '', // DZ 的引用数据在隐藏表单域中，输入框本身无需加前缀
+                        prefixToKeep: '',
                         targetUser: '该层主',
                         targetFloor: '',
                         targetContent: quoteBlock.innerText.trim()
                     };
                 }
-                // 2. 检查高级模式或文本框里是否自带 [quote]...[/quote] 标签
                 const val = targetEl ? targetEl.value : '';
                 const bbcodeMatch = val.match(/^(\[quote\][\s\S]*?\[\/quote\]\s*)/i);
                 if (bbcodeMatch) {
@@ -508,15 +493,15 @@
     }
 
     /**
-     * 实时更新按钮栏右侧的“当前回复模式指示器”（让用户一眼看清当前是【回楼主】还是【回层主 @xxx】）
+     * 实时更新按钮栏左侧的“当前回复模式指示器”（【📢 当前：回楼主】 vs 【🎯 当前：回层主 @xxx】）
      */
     function updateModeBarStatus() {
         const site = getCurrentSite();
         document.querySelectorAll('.gemini-target-badge').forEach(badge => {
-            const targetEl = badge._ boundTarget;
+            const targetEl = badge._boundTarget;
             const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
             if (floorInfo && floorInfo.isFloorReply) {
-                const tag = floorInfo.targetFloor ? `#${floorInfo.targetFloor}` : '';
+                const tag = floorInfo.targetFloor ? ` #${floorInfo.targetFloor}` : '';
                 badge.innerText = `🎯 当前：回层主 ${floorInfo.targetUser}${tag}`;
                 badge.style.background = '#1e3a2f';
                 badge.style.color = '#6ee7b7';
@@ -541,6 +526,10 @@
             if (!target || target.dataset.geminiMounted === 'true') return;
             target.dataset.geminiMounted = 'true';
             mountedNew = true;
+
+            // 监听输入框变化，实时更新“回楼主/回层主”状态徽章
+            target.addEventListener('input', updateModeBarStatus);
+            target.addEventListener('keyup', updateModeBarStatus);
 
             const bar = document.createElement('div');
             bar.className = 'gemini-btn-bar';
