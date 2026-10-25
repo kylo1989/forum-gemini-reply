@@ -5,7 +5,7 @@
 // @description  三档回复梯度：摸鱼黑话 / 20字短评 / 深度分析，完美适配NS站CodeMirror与V2EX/DZ
 // @author       Custom
 // @license      MIT
-// @homepageURL  https://github.com/你的GitHub用户名/forum-gemini-reply
+// @homepageURL  https://github.com/kylo1989/forum-gemini-reply
 // @updateURL    https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
 // @downloadURL  https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
 // @match        *://*.v2ex.com/t/*
