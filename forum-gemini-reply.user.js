@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Discuz)
-// @namespace    https://github.com/你的GitHub用户名/forum-gemini-reply
+// @namespace    https://github.com/kylo1989/forum-gemini-reply
 // @version      3.0.0
 // @description  三档回复梯度：摸鱼黑话 / 20字短评 / 深度分析，完美适配NS站CodeMirror与V2EX/DZ
 // @author       Custom
