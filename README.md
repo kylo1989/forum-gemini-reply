@@ -15,7 +15,7 @@
 
 1. 确保浏览器已安装 **Tampermonkey (篡改猴)** 或 **Violentmonkey (暴力猴)** 扩展。
 2. 点击下方链接即可直接触发油猴安装界面：
-   👉 **[点击此处一键安装脚本](https://raw.githubusercontent.com/你的GitHub用户名/forum-gemini-reply/main/forum-gemini-reply.user.js)**
+   👉 **[点击此处一键安装脚本](https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js)**
 
 ## ⚙️ 使用方法
 
