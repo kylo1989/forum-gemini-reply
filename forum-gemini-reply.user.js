@@ -1,15 +1,16 @@
 // ==UserScript==
-// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek++摸鱼模式 / Discuz全系列)
+// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Linux.do / Discuz)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.7.0
-// @description  完美适配NodeSeek++摸鱼模式(仿微信界面) + 全站支持“回层主 vs 回楼主”智能区分 + 恩山等DZ小窗挂载 + 官方接口同步模型 + 429自动负载均衡
+// @version      3.8.1
+// @description  修复摸鱼模式输入框上下垂直布局 + 全面适配 V2EX/Linux.do/NodeSeek 摸鱼模式与原生模式 + 回层主/回楼主智能区分 + 官方模型同步与429负载均衡
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
 // @updateURL    https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
 // @downloadURL  https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
-// @match        *://*.v2ex.com/t/*
+// @match        *://*.v2ex.com/*
 // @match        *://*.nodeseek.com/*
+// @match        *://*.linux.do/*
 // @match        *://*.right.com.cn/*
 // @match        *://*/*thread-*.html*
 // @match        *://*/*forum.php?mod=viewthread*
@@ -52,13 +53,57 @@
     });
 
     /**
-     * 全局监听“回复层主”按钮点击事件（适配 V2EX、NodeSeek 原生及 NodeSeek++ 摸鱼模式）
+     * 判断当前页面是否开启了“摸鱼模式（仿微信界面）”，并返回摸鱼输入框元素
+     * 适用于 NodeSeek / V2EX / Linux.do 等所有适配该摸鱼插件的站点
+     */
+    function getMoyuInputBox() {
+        const selectors = [
+            'textarea[placeholder*="发送给"]',
+            'input[placeholder*="发送给"]',
+            '[contenteditable="true"][placeholder*="发送给"]',
+            '[data-placeholder*="发送给"]',
+            '.moyu-editor textarea',
+            '.wechat-editor textarea'
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) return el;
+        }
+        return null;
+    }
+
+    /**
+     * 全局监听“回复层主”与摸鱼模式切帖点击事件
      */
     document.addEventListener('click', (e) => {
         const target = e.target;
         if (!target) return;
 
-        // 1. V2EX 点击楼层右侧回复图标
+        // 0. 通用摸鱼模式：点击左侧会话列表切换帖子时，清空上一次的层主缓存并更新状态
+        if (getMoyuInputBox()) {
+            if (target.closest('[class*="session"], [class*="chat-item"], [class*="topic-item"], [class*="conv-item"], [class*="list-item"]')) {
+                lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
+                setTimeout(updateModeBarStatus, 200);
+                return;
+            }
+            // 摸鱼模式下点击右侧聊天气泡里的“回复/引用”
+            const moyuMsgItem = target.closest('[class*="message-item"], [class*="msg-item"], [class*="chat-msg"], [class*="comment-item"], .content-item');
+            const btnText = (target.innerText || target.title || '').trim();
+            const isMoyuReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"], [class*="reply"], [class*="quote"]');
+            if (moyuMsgItem && isMoyuReplyBtn) {
+                const user = moyuMsgItem.querySelector('[class*="nickname"], [class*="author"], [class*="user-name"], .author-name, .username')?.innerText?.trim() || '';
+                const floorEl = moyuMsgItem.querySelector('[class*="floor"], .floor-link, .floor');
+                const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
+                const content = moyuMsgItem.querySelector('[class*="bubble"], [class*="msg-content"], [class*="message-content"], article.post-content, .post-content, [class*="text"]')?.innerText?.trim() || '';
+                if (content) {
+                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
+                    setTimeout(updateModeBarStatus, 150);
+                    return;
+                }
+            }
+        }
+
+        // 1. V2EX 原生页面：点击楼层右侧回复图标
         if (location.hostname.includes('v2ex.com')) {
             const cell = target.closest('.cell[id^="r_"]');
             const isReplyAction = target.closest('a[onclick*="replyOne"], img[alt="Reply"]');
@@ -73,26 +118,39 @@
             }
         }
 
-        // 2. NodeSeek (含原生页面与 nodeseek++ 摸鱼模式)
+        // 2. NodeSeek 原生页面：点击某楼层的“回复 / 引用”按钮
         if (location.hostname.includes('nodeseek.com')) {
-            // 如果在摸鱼模式点击了左侧会话列表切换帖子，清空上一次的层主缓存
-            if (target.closest('[class*="session"], [class*="chat-item"], [class*="topic-item"], [class*="conv-item"]')) {
-                lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
-                setTimeout(updateModeBarStatus, 200);
-                return;
-            }
-
-            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post, [class*="message-item"], [class*="msg-item"], [class*="chat-msg"]');
+            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post');
             const btnText = (target.innerText || target.title || '').trim();
-            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"], [class*="reply"], [class*="quote"]');
+            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"]');
             if (commentItem && isReplyBtn) {
-                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"], [class*="nickname"], [class*="author"], [class*="user-name"]')?.innerText?.trim() || '';
-                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"], [class*="floor"]');
+                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"]')?.innerText?.trim() || '';
+                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"]');
                 const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
-                const content = commentItem.querySelector('article.post-content, .post-content, [class*="bubble"], [class*="msg-content"], [class*="message-content"], [class*="text"]')?.innerText?.trim() || '';
+                const content = commentItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
                 if (content) {
                     lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
                     setTimeout(updateModeBarStatus, 150);
+                }
+            }
+        }
+
+        // 3. Linux.do 原生页面 (Discourse)：点击某楼层底部的“回复”按钮
+        if (location.hostname.includes('linux.do')) {
+            const article = target.closest('article[id^="post_"], .topic-post');
+            const isReplyBtn = target.closest('button.reply, .post-controls .reply, [title*="回复"]');
+            if (article && isReplyBtn) {
+                const postNum = article.getAttribute('id')?.replace('post_', '') || '';
+                if (postNum && postNum !== '1') {
+                    const user = article.querySelector('.username a, .names .first a')?.innerText?.trim() || '';
+                    const content = article.querySelector('.cooked')?.innerText?.trim() || '';
+                    if (content) {
+                        lastClickedFloor = { user: user, floorNum: postNum, content: content, timestamp: Date.now() };
+                        setTimeout(updateModeBarStatus, 250);
+                    }
+                } else {
+                    lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
+                    setTimeout(updateModeBarStatus, 250);
                 }
             }
         }
@@ -213,23 +271,12 @@
     }
 
     /**
-     * 判断当前是否处于 nodeseek++ 的摸鱼模式（仿微信界面）
-     */
-    function getMoyuInputBox() {
-        // 摸鱼模式特征：placeholder 含有 "发送给 " 的 textarea 或 contenteditable 元素
-        const ta = document.querySelector('textarea[placeholder*="发送给"], input[placeholder*="发送给"], [contenteditable="true"][placeholder*="发送给"], [data-placeholder*="发送给"]');
-        if (ta && ta.offsetParent !== null) return ta;
-        return null;
-    }
-
-    /**
-     * 提取 nodeseek++ 摸鱼模式下的帖子标题与聊天流气泡内容
+     * 通用摸鱼模式上下文提取器（适配 NodeSeek / V2EX / Linux.do 的仿微信界面）
      */
     function getMoyuContext() {
         const moyuInput = getMoyuInputBox();
         let title = '';
 
-        // 1. 优先从输入框 placeholder "发送给 xxx" 中提取纯净标题
         if (moyuInput) {
             const ph = moyuInput.getAttribute('placeholder') || moyuInput.getAttribute('data-placeholder') || '';
             if (ph.includes('发送给')) {
@@ -237,7 +284,6 @@
             }
         }
 
-        // 2. 尝试从聊天窗口顶部 Header 提取标题
         if (!title) {
             const headerEl = document.querySelector('[class*="chat-header"], [class*="main-header"], [class*="moyu"] header, [class*="wechat"] header');
             if (headerEl) {
@@ -245,41 +291,38 @@
             }
         }
 
-        // 3. 抓取右侧聊天流里的所有消息气泡
         let bubbles = [];
+        const rightPane = moyuInput ? (moyuInput.closest('[class*="chat"], [class*="main"], [class*="right"], [class*="panel"]') || document.body) : document.body;
+
         const bubbleSelectors = [
-            'article.post-content',
-            '.post-content',
-            '.markdown-body',
             '[class*="bubble-content"]',
             '[class*="msg-content"]',
             '[class*="message-content"]',
             '[class*="chat-content"]',
-            '[class*="msg-text"]'
+            '[class*="msg-text"]',
+            '.markdown-body',
+            'article.post-content',
+            '.post-content',
+            '.cooked'
         ];
 
         for (const sel of bubbleSelectors) {
-            const els = Array.from(document.querySelectorAll(sel)).filter(el => el.offsetParent !== null && el.innerText.trim().length > 0);
+            const els = Array.from(rightPane.querySelectorAll(sel)).filter(el => {
+                return el.offsetParent !== null && (!moyuInput || !el.contains(moyuInput)) && el.innerText.trim().length > 0;
+            });
             if (els.length > 0) {
                 bubbles = els.map(el => el.innerText.trim());
                 break;
             }
         }
 
-        // 兜底：若类名被混淆，通过遍历输入框上方同属右侧主面板的气泡卡片提取
-        if (bubbles.length === 0 && moyuInput) {
-            const rightPane = moyuInput.closest('[class*="main"], [class*="right"], [class*="chat"], [style*="flex"]');
-            if (rightPane) {
-                const msgItems = rightPane.querySelectorAll('[class*="item"], [class*="msg"], [class*="message"]');
-                msgItems.forEach(item => {
-                    if (item.contains(moyuInput)) return;
-                    const clone = item.cloneNode(true);
-                    // 移除时间戳和头像干扰
-                    clone.querySelectorAll('img, time, [class*="time"], [class*="avatar"]').forEach(n => n.remove());
-                    const txt = clone.innerText.trim().replace(/\n+/g, ' ');
-                    if (txt) bubbles.push(txt);
-                });
-            }
+        if (bubbles.length === 0 && rightPane) {
+            const msgItems = rightPane.querySelectorAll('[class*="msg"], [class*="message"], [class*="bubble"]');
+            msgItems.forEach(item => {
+                if (moyuInput && item.contains(moyuInput)) return;
+                const txt = item.innerText.trim().replace(/\n+/g, ' ');
+                if (txt && txt.length > 1) bubbles.push(txt);
+            });
         }
 
         return {
@@ -287,6 +330,89 @@
             content: bubbles[0] || title || '无正文内容',
             replies: bubbles.slice(1, 7).join(' | ')
         };
+    }
+
+    /**
+     * 通用摸鱼模式：检测输入框中是否包含 @层主 或 > 引用块，自动定位层主原话
+     */
+    function detectMoyuFloorTarget(targetEl) {
+        const moyuInput = targetEl || getMoyuInputBox();
+        if (!moyuInput) return null;
+
+        const rawVal = moyuInput.value !== undefined ? moyuInput.value : (moyuInput.innerText || '');
+        if (!rawVal || !rawVal.trim()) {
+            if (lastClickedFloor.content && (Date.now() - lastClickedFloor.timestamp < 15000)) {
+                return {
+                    isFloorReply: true,
+                    prefixToKeep: lastClickedFloor.user ? `@${lastClickedFloor.user} ` : '',
+                    targetUser: lastClickedFloor.user || '层主',
+                    targetFloor: lastClickedFloor.floorNum || '',
+                    targetContent: lastClickedFloor.content
+                };
+            }
+            return null;
+        }
+
+        const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
+        const quoteLines = rawVal.match(/^((?:>[^\n]*\n?)+)\s*/);
+
+        if (!atMatch && !quoteLines) return null;
+
+        let prefix = '';
+        let floorNo = '';
+        let username = '';
+        let floorContent = '';
+
+        if (quoteLines) {
+            prefix = quoteLines[0].trim() + '\n\n';
+            floorContent = quoteLines[1].replace(/^>\s*/gm, '').trim();
+        } else if (atMatch) {
+            prefix = atMatch[1].trim() + ' ';
+            floorNo = atMatch[2] || '';
+            const uMatch = atMatch[1].match(/@([^\s#\]]+)/);
+            username = uMatch ? uMatch[1] : '';
+        }
+
+        if (!floorContent && username) {
+            const items = Array.from(document.querySelectorAll('[class*="message-item"], [class*="msg-item"], [class*="chat-msg"], .content-item, .comment-item'));
+            const matched = items.filter(el => el.innerText.includes(username)).pop();
+            if (matched) {
+                floorContent = matched.querySelector('[class*="bubble"], [class*="content"], .post-content, .cooked')?.innerText?.trim() || matched.innerText.trim();
+            }
+        }
+
+        if (!floorContent && (Date.now() - lastClickedFloor.timestamp < 120000)) {
+            floorContent = lastClickedFloor.content;
+        }
+
+        return {
+            isFloorReply: true,
+            prefixToKeep: prefix,
+            targetUser: username || lastClickedFloor.user || '层主',
+            targetFloor: floorNo || lastClickedFloor.floorNum || '',
+            targetContent: floorContent || `(层主 @${username} 的发言)`
+        };
+    }
+
+    /**
+     * 通用标准 React/Vue 受控文本框写入函数（适配摸鱼模式 textarea 与 Discourse 编辑器）
+     */
+    function fillControlledInput(el, finalOutput) {
+        if (!el) return;
+        el.focus();
+        if (el.value !== undefined) {
+            const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+            const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (nativeSetter) {
+                nativeSetter.call(el, finalOutput);
+            } else {
+                el.value = finalOutput;
+            }
+        } else {
+            el.innerText = finalOutput;
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     /**
@@ -315,14 +441,32 @@
     const siteConfigs = {
         v2ex: {
             match: () => location.hostname.includes('v2ex.com'),
-            title: () => document.querySelector('.header h1')?.innerText || document.title,
-            content: () => document.querySelector('.topic_content')?.innerText || '',
-            replies: () => Array.from(document.querySelectorAll('.reply_content')).slice(0, 5).map(el => el.innerText.trim()).join(' | '),
+            title: () => {
+                if (getMoyuInputBox()) return getMoyuContext().title;
+                return document.querySelector('.header h1')?.innerText || document.title;
+            },
+            content: () => {
+                if (getMoyuInputBox()) return getMoyuContext().content;
+                return document.querySelector('.topic_content')?.innerText || '';
+            },
+            replies: () => {
+                if (getMoyuInputBox()) return getMoyuContext().replies;
+                return Array.from(document.querySelectorAll('.reply_content')).slice(0, 5).map(el => el.innerText.trim()).join(' | ');
+            },
             getMountTargets: () => {
-                const el = document.querySelector('#reply_content');
-                return el ? [el] : [];
+                const targets = [];
+                const moyuInput = getMoyuInputBox();
+                if (moyuInput) targets.push(moyuInput);
+                const nativeEl = document.querySelector('#reply_content');
+                if (nativeEl && nativeEl.offsetParent !== null && !targets.includes(nativeEl)) {
+                    targets.push(nativeEl);
+                }
+                return targets;
             },
             detectFloorTarget: (targetEl) => {
+                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
+                    return detectMoyuFloorTarget(targetEl);
+                }
                 const el = targetEl || document.querySelector('#reply_content');
                 const val = el ? el.value : '';
                 const match = val.match(/^(@([a-zA-Z0-9_-]+)(?:\s+#(\d+))?\s*)/);
@@ -357,14 +501,74 @@
                 };
             },
             fillText: (text, targetEl, prefixToKeep = '') => {
-                const el = targetEl || document.querySelector('#reply_content');
-                if (el) {
-                    el.value = prefixToKeep + text;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.focus();
-                }
+                const el = targetEl || getMoyuInputBox() || document.querySelector('#reply_content');
+                fillControlledInput(el, prefixToKeep + text);
             },
             persona: 'V2EX资深程序员老哥，懂技术、说话直接、有逻辑、不讲客套话'
+        },
+        linuxdo: {
+            match: () => location.hostname.includes('linux.do'),
+            title: () => {
+                if (getMoyuInputBox()) return getMoyuContext().title;
+                return document.querySelector('.fancy-title, #topic-title h1')?.innerText?.trim() || document.title;
+            },
+            content: () => {
+                if (getMoyuInputBox()) return getMoyuContext().content;
+                return document.querySelector('article#post_1 .cooked, .topic-post:first-child .cooked')?.innerText?.trim() || '';
+            },
+            replies: () => {
+                if (getMoyuInputBox()) return getMoyuContext().replies;
+                return Array.from(document.querySelectorAll('article .cooked')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
+            },
+            getMountTargets: () => {
+                const targets = [];
+                const moyuInput = getMoyuInputBox();
+                if (moyuInput) targets.push(moyuInput);
+                const discourseInput = document.querySelector('textarea.d-editor-input');
+                if (discourseInput && discourseInput.offsetParent !== null && !targets.includes(discourseInput)) {
+                    targets.push(discourseInput);
+                }
+                return targets;
+            },
+            detectFloorTarget: (targetEl) => {
+                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
+                    return detectMoyuFloorTarget(targetEl);
+                }
+                const val = targetEl ? targetEl.value : '';
+                const quoteMatch = val.match(/^(\[quote="([^,"]+)[^"]*?"\][\s\S]*?\[\/quote\]\s*)/i);
+                if (quoteMatch) {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: quoteMatch[1],
+                        targetUser: quoteMatch[2],
+                        targetFloor: '',
+                        targetContent: quoteMatch[1].replace(/\[\/?quote[^\]]*\]/gi, '').trim()
+                    };
+                }
+                const replyToUserEl = document.querySelector('#reply-control .reply-details .user-link, #reply-control .composer-action-title .user-link');
+                if (replyToUserEl) {
+                    const username = replyToUserEl.innerText.trim();
+                    let floorContent = lastClickedFloor.user === username ? lastClickedFloor.content : '';
+                    if (!floorContent) {
+                        const posts = Array.from(document.querySelectorAll('article.topic-post'));
+                        const matched = posts.filter(p => p.innerText.includes(username)).pop();
+                        if (matched) floorContent = matched.querySelector('.cooked')?.innerText?.trim() || '';
+                    }
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: '',
+                        targetUser: username,
+                        targetFloor: lastClickedFloor.floorNum || '',
+                        targetContent: floorContent || `(佬友 @${username} 的发言)`
+                    };
+                }
+                return null;
+            },
+            fillText: (text, targetEl, prefixToKeep = '') => {
+                const el = targetEl || getMoyuInputBox() || document.querySelector('textarea.d-editor-input');
+                fillControlledInput(el, prefixToKeep + text);
+            },
+            persona: 'Linux.do (L站) 资深开源与AI技术社区佬友，懂AI大模型、Docker、自建服务、网络与开发，称呼坛友为“佬”或“佬友”，说话真诚接地气，常用“感谢大佬分享”、“太强了佬”、“前排支持”等社区用语'
         },
         nodeseek: {
             match: () => location.hostname.includes('nodeseek.com'),
@@ -382,11 +586,9 @@
             },
             getMountTargets: () => {
                 const targets = [];
-                // 1. 优先检测 nodeseek++ 摸鱼模式输入框
                 const moyuInput = getMoyuInputBox();
                 if (moyuInput) targets.push(moyuInput);
 
-                // 2. 原生帖子页面的 CodeMirror 编辑器
                 const nativeEl = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
                 if (nativeEl && nativeEl.offsetParent !== null && !targets.includes(nativeEl)) {
                     targets.push(nativeEl);
@@ -394,12 +596,13 @@
                 return targets;
             },
             detectFloorTarget: (targetEl) => {
+                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
+                    return detectMoyuFloorTarget(targetEl);
+                }
                 const rawVal = getNodeSeekEditorText(targetEl);
                 if (!rawVal || !rawVal.trim()) return null;
 
-                // 匹配 "@username #12 " 或 "[@username](/space/...) #12"
                 const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
-                // 匹配 Markdown 引用块 "> 某层主原话"
                 const quoteLines = rawVal.match(/^((?:>[^\n]*\n?)+)\s*/);
 
                 if (!atMatch && !quoteLines) return null;
@@ -419,7 +622,7 @@
                     username = uMatch ? uMatch[1] : '';
                 }
 
-                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content, [class*="bubble-content"], [class*="msg-content"]'));
+                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content'));
 
                 if (!floorContent && floorNo) {
                     const idx = parseInt(floorNo, 10);
@@ -434,10 +637,10 @@
                 }
 
                 if (!floorContent && username) {
-                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item, [class*="message-item"], [class*="msg-item"]'));
+                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item'));
                     const matchedItem = items.filter(item => item.innerText.includes(username)).pop();
                     if (matchedItem) {
-                        floorContent = matchedItem.querySelector('article.post-content, .post-content, [class*="bubble"], [class*="content"]')?.innerText?.trim() || '';
+                        floorContent = matchedItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
                     }
                 }
 
@@ -457,28 +660,11 @@
                 const finalOutput = prefixToKeep + text;
                 const moyuInput = getMoyuInputBox();
 
-                // 方案0：如果当前是 nodeseek++ 摸鱼模式的输入框（标准 textarea / input 或 contenteditable）
-                const activeBox = (targetEl && (targetEl === moyuInput || targetEl.tagName === 'TEXTAREA' || targetEl.tagName === 'INPUT')) ? targetEl : moyuInput;
-                if (activeBox && !activeBox.closest('.CodeMirror')) {
-                    activeBox.focus();
-                    if (activeBox.value !== undefined) {
-                        // 兼容 React / Vue 受控组件的原生 value setter
-                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set ||
-                                             Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                        if (nativeSetter) {
-                            nativeSetter.call(activeBox, finalOutput);
-                        } else {
-                            activeBox.value = finalOutput;
-                        }
-                    } else {
-                        activeBox.innerText = finalOutput;
-                    }
-                    activeBox.dispatchEvent(new Event('input', { bubbles: true }));
-                    activeBox.dispatchEvent(new Event('change', { bubbles: true }));
+                if (moyuInput && (targetEl === moyuInput || !targetEl?.classList?.contains('CodeMirror'))) {
+                    fillControlledInput(moyuInput, finalOutput);
                     return;
                 }
 
-                // 方案1：原生页面 CodeMirror 实例写入
                 const cmEl = (targetEl && targetEl.classList?.contains('CodeMirror')) ? targetEl : document.querySelector('.CodeMirror');
                 if (cmEl && cmEl.CodeMirror) {
                     cmEl.CodeMirror.setValue(finalOutput);
@@ -487,7 +673,6 @@
                     return;
                 }
 
-                // 方案2：针对 CodeMirror 隐藏 textarea 模拟粘贴事件
                 const hiddenTa = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
                 if (hiddenTa) {
                     hiddenTa.focus();
@@ -504,7 +689,7 @@
                     }, 100);
                 }
             },
-            persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区黑话（bd、好鸡、早收、富哥、溢价、灵车、分母、吃码等）'
+            persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区常用词（如：bd、绑定、好鸡、早收、溢价、灵车、分母、吃码等，注意严禁使用“富哥”一词）'
         },
         discuz: {
             match: () => true,
@@ -585,12 +770,12 @@
             maxTokens: 512,
             rulesForOP: `
 1. 你正在【直接回复楼主（主楼）】，这是纯水贴拿积分/思考/鸡腿模式，字数控制在 2~8 个字！
-2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、思考一下、老哥稳、帮顶、bd、好鸡早收、分母来了）。
-3. 严禁加句号，严禁换行，绝不要包含 @用户名，只输出最终回复的那几个字！`,
+2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、太强了佬、思考一下、老哥稳、帮顶、bd、好鸡早收、分母来了）。
+3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要包含 @用户名，只输出最终回复的那几个字！`,
             rulesForFloor: `
 1. 你正在【直接回应某位层主】，字数控制在 2~10 个字！
 2. 针对【你正在直接回应的层主发言】，用极简的一两个词附和、接梗、赞同或调侃他（例如：老哥真相了、确实如此、同感、扎心了、借您吉言、哈哈真实、+1）。
-3. 严禁加句号，严禁换行，绝不要自己输出 @用户名（系统会自动加），只输出回复正文那几个字！`
+3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要自己输出 @用户名（系统会自动加），只输出回复正文那几个字！`
         },
         {
             label: '💬 简短互动 (40字左右)',
@@ -599,11 +784,11 @@
             rulesForOP: `
 1. 你正在【直接回复楼主（主楼）】，针对主楼内容，用一两句自然的大白话发表看法、吐槽、补充经验或互动。
 2. 字数控制在 25~55 个字左右（约一到两句话），必须把整句话的逻辑和意思表达完整，绝对不能话说到一半断掉！
-3. 语气要像真人坛友日常敲字交流，口语化、接地气，严禁出现“总的来说”、“确实”、“希望”、“首先”等AI客套词。绝不要包含 @用户名，只输出回复正文！`,
+3. 语气要像真人坛友日常敲字交流，口语化、接地气，严禁出现“富哥”、“总的来说”、“确实”、“希望”、“首先”等词。绝不要包含 @用户名，只输出回复正文！`,
             rulesForFloor: `
 1. 你正在【直接与某位层主对话/对线】！请把注意力 100% 集中在【你正在直接回应的层主发言】上（主楼内容仅作背景参考）。
 2. 顺着这位层主的话进行回应（赞同补充、解答他的疑问、反驳他的观点或顺着吐槽），字数控制在 20~50 个字左右，必须把话完整说完，绝不断句！
-3. 语气要像真人坛友在楼层里直接跟人搭话，自然口语化，严禁在开头自己写 @用户名（系统已自带前缀），只输出纯回复正文！`
+3. 语气要像真人坛友在楼层里直接跟人搭话，自然口语化，严禁出现“富哥”二字，严禁在开头自己写 @用户名（系统已自带前缀），只输出纯回复正文！`
         },
         {
             label: '🧐 详细分析 (完整深度回复)',
@@ -611,17 +796,18 @@
             maxTokens: 2048,
             rulesForOP: `
 1. 你正在【直接回复楼主（主楼）】，针对主楼的问题、方案、教程或分享，给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！
-2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种死板的AI公文套路。
+2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“富哥”、“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种套话。
 3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），只输出回复正文！`,
             rulesForFloor: `
 1. 你正在【深度回应/解答某位层主的观点或追问】！请重点针对【你正在直接回应的层主发言】展开深度分析、技术探讨、细节补充或有理有据的反驳，结合主楼背景把道理讲透，字数控制在 100~300 字左右，严禁半途截断！
-2. 保持论坛资深技术老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“首先、其次、最后、综上所述”等AI套话，也不要使用 Markdown 加粗符号（**）。
+2. 保持论坛资深技术老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“富哥”、“首先、其次、最后、综上所述”等套话，也不要使用 Markdown 加粗符号（**）。
 3. 严禁在开头自己输出 @用户名（系统已保留前缀），只输出纯回复正文！`
         }
     ];
 
     function getCurrentSite() {
         if (siteConfigs.v2ex.match()) return siteConfigs.v2ex;
+        if (siteConfigs.linuxdo.match()) return siteConfigs.linuxdo;
         if (siteConfigs.nodeseek.match()) return siteConfigs.nodeseek;
         return siteConfigs.discuz;
     }
@@ -666,7 +852,7 @@
 
             const bar = document.createElement('div');
             bar.className = 'gemini-btn-bar';
-            bar.style.cssText = 'margin: 6px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; z-index: 9999; text-align: left;';
+            bar.style.cssText = 'width: 100%; box-sizing: border-box; margin: 4px 0 6px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; z-index: 9999; text-align: left; flex-shrink: 0;';
 
             // 0. 创建“回楼主 / 回层主”状态指示标签
             const badge = document.createElement('span');
@@ -719,7 +905,21 @@
             };
             bar.appendChild(refreshBtn);
 
-            target.parentNode.insertBefore(bar, target);
+            const parent = target.parentNode;
+            if (parent) {
+                const parentStyle = window.getComputedStyle(parent);
+                const isMoyu = (target === getMoyuInputBox());
+                const isDiscourse = target.classList?.contains('d-editor-input');
+
+                if (isMoyu || isDiscourse || (parentStyle.display.includes('flex') && parentStyle.flexDirection === 'row')) {
+                    parent.style.display = 'flex';
+                    parent.style.flexDirection = 'column';
+                    parent.style.alignItems = 'stretch';
+                    target.style.width = '100%';
+                    target.style.boxSizing = 'border-box';
+                }
+                parent.insertBefore(bar, target);
+            }
         });
 
         if (mountedNew) {
