@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Linux.do / Discuz)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.8.1
-// @description  修复摸鱼模式输入框上下垂直布局 + 全面适配 V2EX/Linux.do/NodeSeek 摸鱼模式与原生模式 + 回层主/回楼主智能区分 + 官方模型同步与429负载均衡
+// @version      3.9.0
+// @description  修复NS摸鱼模式回帖不生效问题(execCommand真实输入唤醒Vue状态) + 为Linux.do摸鱼模式自动补全底部回复框与直连发帖 + 回层主/回楼主区分 + 429自动负载均衡
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
@@ -30,6 +30,8 @@
 
     // 记录用户最近一次在页面上点击“回复某层主”时捕获的层主信息
     let lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
+    // 记录摸鱼模式下当前选中的帖子 ID (用于 linux.do 补全发帖框直连发帖)
+    let currentMoyuTopicId = '';
 
     const FALLBACK_MODELS = [
         { id: 'gemini-2.0-flash', label: '⚡ gemini-2.0-flash (主力推荐·每日1500次高额度)', priority: 100 },
@@ -53,1042 +55,201 @@
     });
 
     /**
-     * 判断当前页面是否开启了“摸鱼模式（仿微信界面）”，并返回摸鱼输入框元素
-     * 适用于 NodeSeek / V2EX / Linux.do 等所有适配该摸鱼插件的站点
+     * 轻量级右上角状态通知 Toast（用于提示摸鱼模式回帖是否真正成功或被 CD/CF 拦截）
      */
-    function getMoyuInputBox() {
-        const selectors = [
-            'textarea[placeholder*="发送给"]',
-            'input[placeholder*="发送给"]',
-            '[contenteditable="true"][placeholder*="发送给"]',
-            '[data-placeholder*="发送给"]',
-            '.moyu-editor textarea',
-            '.wechat-editor textarea'
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null) return el;
+    function showToast(msg, isError = false) {
+        const toast = document.createElement('div');
+        toast.innerText = msg;
+        toast.style.cssText = `position: fixed; top: 20px; right: 20px; padding: 10px 16px; background: ${isError ? '#dc2626' : '#059669'}; color: #fff; border-radius: 6px; font-size: 13px; font-weight: bold; z-index: 999999; box-shadow: 0 4px 12px rgba(0,0,0,0.3); transition: opacity 0.3s;`;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => toast.remove(), 300);
+        }, 3500);
+    }
+
+    /**
+     * 拦截监控页面 fetch 请求：
+     * 1. 捕获摸鱼模式当前加载的帖子 ID（供 linux.do 自建发帖框使用）
+     * 2. 监控 NodeSeek 摸鱼模式下的发帖响应，若因 CD 冷却或 CF 验证失败而未生效，立即弹窗提醒用户
+     */
+    const origFetch = window.fetch;
+    if (origFetch) {
+        window.fetch = async function(...args) {
+            const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+            // 捕获 linux.do 摸鱼模式点击左侧列表时请求的帖子 ID (/t/xxx.json 或 /t/slug/12345.json)
+            if (location.hostname.includes('linux.do')) {
+                const tMatch = url.match(/\/t\/(?:[^\/]+\/)?(\d+)\.json/);
+                if (tMatch) currentMoyuTopicId = tMatch[1];
+            }
+
+            const response = await origFetch.apply(this, args);
+
+            // 监控 NodeSeek 发帖接口返回结果，排查“为什么很多回复没生效”
+            if (location.hostname.includes('nodeseek.com') && (url.includes('comment') || url.includes('reply') || url.includes('/api/content/'))) {
+                const method = (args[1]?.method || 'GET').toUpperCase();
+                if (method === 'POST') {
+                    response.clone().json().then(data => {
+                        if (data && data.success === false) {
+                            showToast(`⚠️ NS回帖未生效：${data.message || data.msg || '触发发帖冷却CD或权限限制'}`, true);
+                        } else if (data && (data.success === true || data.id)) {
+                            showToast(`✅ NS回帖已成功生效！`, false);
+                        }
+                    }).catch(() => {
+                        if (!response.ok) {
+                            showToast(`⚠️ NS回帖被拦截 (HTTP ${response.status})：可能触发了 Cloudflare 验证或发帖过快`, true);
+                        }
+                    });
+                }
+            }
+            return response;
+        };
+    }
+
+    /**
+     * 检测页面是否处于“摸鱼模式（仿微信界面）”
+     */
+    function isMoyuModeActive() {
+        // 检查是否存在左侧会话列表 + 右侧主面板的仿微信布局特征
+        if (document.querySelector('textarea[placeholder*="发送给"], input[placeholder*="发送给"]')) return true;
+        // 针对 linux.do 等没有原生渲染输入框的摸鱼界面：检查是否存在顶部带 "新回复" 搜索栏和左侧会话列表的摸鱼容器
+        const allInputs = Array.from(document.querySelectorAll('input[placeholder*="搜索"]'));
+        for (const inp of allInputs) {
+            const parentText = inp.parentElement?.parentElement?.innerText || '';
+            if (parentText.includes('新回复') || parentText.includes('最热')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 获取摸鱼模式的右侧聊天主面板容器（用于提取气泡或为 linux.do 补全底部回复框）
+     */
+    function getMoyuRightChatPane() {
+        // 寻找顶部包含 "(数字)" 楼层统计的标题栏所在的右侧主容器（如 "学生党纠结值不值得买... (27)"）
+        const candidates = Array.from(document.querySelectorAll('div, header'));
+        for (const el of candidates) {
+            if (el.children.length <= 3 && /\(\d+\)\s*$/.test(el.innerText.trim())) {
+                const rect = el.getBoundingClientRect();
+                // 位于右侧主区域顶部
+                if (rect.left > 200 && rect.top >= 0 && rect.top < 120 && rect.width > 300) {
+                    return el.parentElement;
+                }
+            }
         }
         return null;
     }
 
     /**
-     * 全局监听“回复层主”与摸鱼模式切帖点击事件
+     * 针对 linux.do 摸鱼模式缺失回复框的问题：自动在右侧聊天窗底部构建仿微信回复框 + 直连发帖按钮
      */
-    document.addEventListener('click', (e) => {
-        const target = e.target;
-        if (!target) return;
+    function ensureLinuxDoMoyuReplyBox() {
+        if (!location.hostname.includes('linux.do')) return null;
+        const existingCustom = document.querySelector('#gemini-linuxdo-moyu-input');
+        if (existingCustom && existingCustom.offsetParent !== null) return existingCustom;
 
-        // 0. 通用摸鱼模式：点击左侧会话列表切换帖子时，清空上一次的层主缓存并更新状态
-        if (getMoyuInputBox()) {
-            if (target.closest('[class*="session"], [class*="chat-item"], [class*="topic-item"], [class*="conv-item"], [class*="list-item"]')) {
-                lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
-                setTimeout(updateModeBarStatus, 200);
+        const rightPane = getMoyuRightChatPane();
+        if (!rightPane) return null;
+
+        // 检查是否已经有原生的摸鱼输入框
+        const nativeMoyu = rightPane.querySelector('textarea[placeholder*="发送给"]');
+        if (nativeMoyu) return nativeMoyu;
+
+        // 创建补全的底部输入区容器
+        const wrapper = document.createElement('div');
+        wrapper.id = 'gemini-linuxdo-moyu-box';
+        wrapper.style.cssText = 'border-top: 1px solid #e5e7eb; background: #ffffff; padding: 8px 16px 12px 16px; display: flex; flex-direction: column; flex-shrink: 0; z-index: 999;';
+
+        const ta = document.createElement('textarea');
+        ta.id = 'gemini-linuxdo-moyu-input';
+        const headerText = rightPane.firstElementChild?.innerText?.replace(/\(\d+\)\s*$/, '')?.trim() || '当前话题';
+        ta.placeholder = `发送给 ${headerText} (Ctrl + Enter 发送)`;
+        ta.style.cssText = 'width: 100%; height: 68px; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px; font-size: 13px; color: #1f2937; background: #f9fafb; resize: none; outline: none; box-sizing: border-box; margin-top: 4px;';
+
+        const bottomRow = document.createElement('div');
+        bottomRow.style.cssText = 'display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 6px;';
+
+        const tip = document.createElement('span');
+        tip.innerText = 'Ctrl + Enter 发送';
+        tip.style.cssText = 'font-size: 12px; color: #9ca3af;';
+
+        const sendBtn = document.createElement('button');
+        sendBtn.type = 'button';
+        sendBtn.innerText = '发送';
+        sendBtn.style.cssText = 'padding: 5px 18px; background: #07c160; color: #fff; border: none; border-radius: 4px; font-size: 13px; font-weight: bold; cursor: pointer;';
+
+        const doSubmitLinuxDo = async () => {
+            const rawText = ta.value.trim();
+            if (!rawText) {
+                alert('请先生成或输入回复内容！');
                 return;
             }
-            // 摸鱼模式下点击右侧聊天气泡里的“回复/引用”
-            const moyuMsgItem = target.closest('[class*="message-item"], [class*="msg-item"], [class*="chat-msg"], [class*="comment-item"], .content-item');
-            const btnText = (target.innerText || target.title || '').trim();
-            const isMoyuReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"], [class*="reply"], [class*="quote"]');
-            if (moyuMsgItem && isMoyuReplyBtn) {
-                const user = moyuMsgItem.querySelector('[class*="nickname"], [class*="author"], [class*="user-name"], .author-name, .username')?.innerText?.trim() || '';
-                const floorEl = moyuMsgItem.querySelector('[class*="floor"], .floor-link, .floor');
-                const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
-                const content = moyuMsgItem.querySelector('[class*="bubble"], [class*="msg-content"], [class*="message-content"], article.post-content, .post-content, [class*="text"]')?.innerText?.trim() || '';
-                if (content) {
-                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
-                    setTimeout(updateModeBarStatus, 150);
-                    return;
-                }
+
+            // 1. 获取当前摸鱼会话对应的 Topic ID
+            let topicId = currentMoyuTopicId;
+            if (!topicId) {
+                // 尝试从页面链接或选中项提取
+                const activeLink = document.querySelector('a[href*="/t/"][class*="active"], [class*="active"] a[href*="/t/"]');
+                const m = activeLink?.getAttribute('href')?.match(/\/t\/(?:[^\/]+\/)?(\d+)/);
+                if (m) topicId = m[1];
             }
-        }
-
-        // 1. V2EX 原生页面：点击楼层右侧回复图标
-        if (location.hostname.includes('v2ex.com')) {
-            const cell = target.closest('.cell[id^="r_"]');
-            const isReplyAction = target.closest('a[onclick*="replyOne"], img[alt="Reply"]');
-            if (cell && isReplyAction) {
-                const user = cell.querySelector('strong a.dark')?.innerText?.trim() || '';
-                const floorNum = cell.querySelector('.no')?.innerText?.trim() || '';
-                const content = cell.querySelector('.reply_content')?.innerText?.trim() || '';
-                if (content) {
-                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
-                    setTimeout(updateModeBarStatus, 100);
-                }
+            if (!topicId) {
+                const inputId = prompt('未能自动捕获当前话题 ID，请点击左侧话题列表刷新，或手动输入帖子数字 ID：');
+                if (!inputId) return;
+                topicId = inputId.trim();
             }
-        }
 
-        // 2. NodeSeek 原生页面：点击某楼层的“回复 / 引用”按钮
-        if (location.hostname.includes('nodeseek.com')) {
-            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post');
-            const btnText = (target.innerText || target.title || '').trim();
-            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"]');
-            if (commentItem && isReplyBtn) {
-                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"]')?.innerText?.trim() || '';
-                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"]');
-                const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
-                const content = commentItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
-                if (content) {
-                    lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
-                    setTimeout(updateModeBarStatus, 150);
-                }
+            // 2. 获取 Discourse CSRF Token
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+            if (!csrfToken) {
+                alert('未获取到登录凭证 (CSRF Token)，请确认您已登录 linux.do！');
+                return;
             }
-        }
 
-        // 3. Linux.do 原生页面 (Discourse)：点击某楼层底部的“回复”按钮
-        if (location.hostname.includes('linux.do')) {
-            const article = target.closest('article[id^="post_"], .topic-post');
-            const isReplyBtn = target.closest('button.reply, .post-controls .reply, [title*="回复"]');
-            if (article && isReplyBtn) {
-                const postNum = article.getAttribute('id')?.replace('post_', '') || '';
-                if (postNum && postNum !== '1') {
-                    const user = article.querySelector('.username a, .names .first a')?.innerText?.trim() || '';
-                    const content = article.querySelector('.cooked')?.innerText?.trim() || '';
-                    if (content) {
-                        lastClickedFloor = { user: user, floorNum: postNum, content: content, timestamp: Date.now() };
-                        setTimeout(updateModeBarStatus, 250);
-                    }
-                } else {
-                    lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
-                    setTimeout(updateModeBarStatus, 250);
+            // 如果开头带有 "@username #floor "，提取出楼层号传给 reply_to_post_number，并清理多余前缀
+            let replyToPostNumber = undefined;
+            let cleanPostContent = rawText;
+            const floorMatch = rawText.match(/^@([^\s#]+)(?:\s*#(\d+))?\s+/);
+            if (floorMatch) {
+                if (floorMatch[2] && floorMatch[2] !== '1') {
+                    replyToPostNumber = parseInt(floorMatch[2], 10);
+                } else if (lastClickedFloor.floorNum && lastClickedFloor.floorNum !== '1') {
+                    replyToPostNumber = parseInt(lastClickedFloor.floorNum, 10);
                 }
+                cleanPostContent = rawText.replace(/^@([^\s#]+)(?:\s*#(\d+))?\s+/, '');
             }
-        }
-    }, true);
 
-    function annotateModel(modelId) {
-        const id = modelId.toLowerCase();
-        if (id === 'gemini-2.0-flash') return { label: `⚡ ${modelId} (主力推荐·高额度秒回)`, priority: 100 };
-        if (id === 'gemini-2.5-flash-lite' || id.startsWith('gemini-2.5-flash-lite-')) return { label: `🚀 ${modelId} (2.5极速轻量·高额度推荐)`, priority: 96 };
-        if (id === 'gemini-2.0-flash-lite' || id.startsWith('gemini-2.0-flash-lite-')) return { label: `💨 ${modelId} (2.0超轻量·高额度极速)`, priority: 92 };
-        if (id === 'gemini-1.5-flash' || id === 'gemini-1.5-flash-latest') return { label: `🛡️ ${modelId} (经典稳定·高额度备用)`, priority: 88 };
-        if (id.includes('1.5-flash-8b')) return { label: `🍃 ${modelId} (8B超轻量·高频防限流)`, priority: 84 };
-        if (id === 'gemini-2.5-flash') return { label: `🧠 ${modelId} (2.5标准版·免费额度严苛)`, priority: 55 };
+            sendBtn.innerText = '发送中...';
+            sendBtn.disabled = true;
 
-        if (id.includes('flash-lite')) return { label: `🚀 ${modelId} (轻量Flash·高额度极速)`, priority: 90 };
-        if (id.includes('flash') && !id.includes('exp') && !id.includes('preview') && !id.includes('thinking')) return { label: `⚡ ${modelId} (Flash高速版·均衡推荐)`, priority: 78 };
-        if (id.includes('flash') && (id.includes('exp') || id.includes('preview') || id.includes('thinking'))) return { label: `🧪 ${modelId} (实验/思考预览版·额度较少)`, priority: 45 };
-        if (id.includes('pro')) return { label: `💎 ${modelId} (Pro深度推理·免费额度极少)`, priority: 30 };
-
-        return { label: `🤖 ${modelId} (官方可用模型)`, priority: 40 };
-    }
-
-    function isTextChatModel(rawModel) {
-        const name = (rawModel.name || '').replace('models/', '');
-        const methods = rawModel.supportedGenerationMethods || [];
-        if (!methods.includes('generateContent')) return false;
-        if (!name.startsWith('gemini-')) return false;
-        const excludeKeywords = ['vision', 'image', 'audio', 'tts', 'embedding', 'aqa', 'robotics', 'computer-use', '-001', '-002'];
-        if (excludeKeywords.some(kw => name.includes(kw))) return false;
-        return true;
-    }
-
-    function fetchOfficialModels(force = false, showAlert = false) {
-        const apiKey = GM_getValue("GEMINI_API_KEY", "");
-        if (!apiKey) {
-            if (showAlert) alert("请先设置 Gemini API Key 后再同步模型列表！");
-            return;
-        }
-
-        const lastFetch = GM_getValue("GEMINI_MODELS_LAST_FETCH", 0);
-        const cached = GM_getValue("GEMINI_MODELS_CACHE", null);
-        if (!force && cached && (Date.now() - lastFetch < CACHE_TTL)) return;
-
-        document.querySelectorAll('.gemini-model-refresh-btn').forEach(b => { b.innerText = '⏳'; });
-
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: `https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key=${apiKey}`,
-            onload: function(response) {
-                document.querySelectorAll('.gemini-model-refresh-btn').forEach(b => { b.innerText = '🔄'; });
-                try {
-                    const data = JSON.parse(response.responseText);
-                    if (data.error) {
-                        if (showAlert) alert(`同步模型失败: ${data.error.message}`);
-                        return;
-                    }
-
-                    const rawModels = data.models || [];
-                    const parsedMap = new Map();
-
-                    rawModels.forEach(m => {
-                        if (!isTextChatModel(m)) return;
-                        const id = m.name.replace('models/', '');
-                        const info = annotateModel(id);
-                        parsedMap.set(id, { id: id, label: info.label, priority: info.priority });
-                    });
-
-                    let modelList = Array.from(parsedMap.values());
-                    if (modelList.length === 0) {
-                        modelList = FALLBACK_MODELS;
-                    } else {
-                        modelList.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
-                    }
-
-                    GM_setValue("GEMINI_MODELS_CACHE", modelList);
-                    GM_setValue("GEMINI_MODELS_LAST_FETCH", Date.now());
-                    syncAllModelSelects();
-
-                    if (showAlert) {
-                        alert(`✅ 同步成功！已从 Google 官方接口获取到 ${modelList.length} 个可用 Gemini 模型。`);
-                    }
-                } catch (e) {
-                    console.error("[Gemini助手] 解析模型列表失败:", e);
-                    if (showAlert) alert("解析官方模型列表失败，请检查网络设置。");
-                }
-            },
-            onerror: function() {
-                document.querySelectorAll('.gemini-model-refresh-btn').forEach(b => { b.innerText = '🔄'; });
-                if (showAlert) alert("网络请求失败，无法连接 generativelanguage.googleapis.com");
-            }
-        });
-    }
-
-    function getAvailableModels() {
-        const cached = GM_getValue("GEMINI_MODELS_CACHE", null);
-        return (cached && Array.isArray(cached) && cached.length > 0) ? cached : FALLBACK_MODELS;
-    }
-
-    function syncAllModelSelects() {
-        const models = getAvailableModels();
-        let currentSaved = GM_getValue("GEMINI_MODEL", DEFAULT_MODEL);
-        if (!models.some(m => m.id === currentSaved) && models.length > 0) {
-            currentSaved = models[0].id;
-            GM_setValue("GEMINI_MODEL", currentSaved);
-        }
-
-        document.querySelectorAll('.gemini-model-select').forEach(selectEl => {
-            selectEl.innerHTML = '';
-            models.forEach(m => {
-                const opt = document.createElement('option');
-                opt.value = m.id;
-                opt.innerText = m.label;
-                if (m.id === currentSaved) opt.selected = true;
-                selectEl.appendChild(opt);
-            });
-            selectEl.value = currentSaved;
-        });
-    }
-
-    /**
-     * 通用摸鱼模式上下文提取器（适配 NodeSeek / V2EX / Linux.do 的仿微信界面）
-     */
-    function getMoyuContext() {
-        const moyuInput = getMoyuInputBox();
-        let title = '';
-
-        if (moyuInput) {
-            const ph = moyuInput.getAttribute('placeholder') || moyuInput.getAttribute('data-placeholder') || '';
-            if (ph.includes('发送给')) {
-                title = ph.replace(/^.*发送给\s*/, '').trim();
-            }
-        }
-
-        if (!title) {
-            const headerEl = document.querySelector('[class*="chat-header"], [class*="main-header"], [class*="moyu"] header, [class*="wechat"] header');
-            if (headerEl) {
-                title = headerEl.innerText.replace(/\(\d+\)\s*$/, '').trim();
-            }
-        }
-
-        let bubbles = [];
-        const rightPane = moyuInput ? (moyuInput.closest('[class*="chat"], [class*="main"], [class*="right"], [class*="panel"]') || document.body) : document.body;
-
-        const bubbleSelectors = [
-            '[class*="bubble-content"]',
-            '[class*="msg-content"]',
-            '[class*="message-content"]',
-            '[class*="chat-content"]',
-            '[class*="msg-text"]',
-            '.markdown-body',
-            'article.post-content',
-            '.post-content',
-            '.cooked'
-        ];
-
-        for (const sel of bubbleSelectors) {
-            const els = Array.from(rightPane.querySelectorAll(sel)).filter(el => {
-                return el.offsetParent !== null && (!moyuInput || !el.contains(moyuInput)) && el.innerText.trim().length > 0;
-            });
-            if (els.length > 0) {
-                bubbles = els.map(el => el.innerText.trim());
-                break;
-            }
-        }
-
-        if (bubbles.length === 0 && rightPane) {
-            const msgItems = rightPane.querySelectorAll('[class*="msg"], [class*="message"], [class*="bubble"]');
-            msgItems.forEach(item => {
-                if (moyuInput && item.contains(moyuInput)) return;
-                const txt = item.innerText.trim().replace(/\n+/g, ' ');
-                if (txt && txt.length > 1) bubbles.push(txt);
-            });
-        }
-
-        return {
-            title: title || document.title,
-            content: bubbles[0] || title || '无正文内容',
-            replies: bubbles.slice(1, 7).join(' | ')
-        };
-    }
-
-    /**
-     * 通用摸鱼模式：检测输入框中是否包含 @层主 或 > 引用块，自动定位层主原话
-     */
-    function detectMoyuFloorTarget(targetEl) {
-        const moyuInput = targetEl || getMoyuInputBox();
-        if (!moyuInput) return null;
-
-        const rawVal = moyuInput.value !== undefined ? moyuInput.value : (moyuInput.innerText || '');
-        if (!rawVal || !rawVal.trim()) {
-            if (lastClickedFloor.content && (Date.now() - lastClickedFloor.timestamp < 15000)) {
-                return {
-                    isFloorReply: true,
-                    prefixToKeep: lastClickedFloor.user ? `@${lastClickedFloor.user} ` : '',
-                    targetUser: lastClickedFloor.user || '层主',
-                    targetFloor: lastClickedFloor.floorNum || '',
-                    targetContent: lastClickedFloor.content
-                };
-            }
-            return null;
-        }
-
-        const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
-        const quoteLines = rawVal.match(/^((?:>[^\n]*\n?)+)\s*/);
-
-        if (!atMatch && !quoteLines) return null;
-
-        let prefix = '';
-        let floorNo = '';
-        let username = '';
-        let floorContent = '';
-
-        if (quoteLines) {
-            prefix = quoteLines[0].trim() + '\n\n';
-            floorContent = quoteLines[1].replace(/^>\s*/gm, '').trim();
-        } else if (atMatch) {
-            prefix = atMatch[1].trim() + ' ';
-            floorNo = atMatch[2] || '';
-            const uMatch = atMatch[1].match(/@([^\s#\]]+)/);
-            username = uMatch ? uMatch[1] : '';
-        }
-
-        if (!floorContent && username) {
-            const items = Array.from(document.querySelectorAll('[class*="message-item"], [class*="msg-item"], [class*="chat-msg"], .content-item, .comment-item'));
-            const matched = items.filter(el => el.innerText.includes(username)).pop();
-            if (matched) {
-                floorContent = matched.querySelector('[class*="bubble"], [class*="content"], .post-content, .cooked')?.innerText?.trim() || matched.innerText.trim();
-            }
-        }
-
-        if (!floorContent && (Date.now() - lastClickedFloor.timestamp < 120000)) {
-            floorContent = lastClickedFloor.content;
-        }
-
-        return {
-            isFloorReply: true,
-            prefixToKeep: prefix,
-            targetUser: username || lastClickedFloor.user || '层主',
-            targetFloor: floorNo || lastClickedFloor.floorNum || '',
-            targetContent: floorContent || `(层主 @${username} 的发言)`
-        };
-    }
-
-    /**
-     * 通用标准 React/Vue 受控文本框写入函数（适配摸鱼模式 textarea 与 Discourse 编辑器）
-     */
-    function fillControlledInput(el, finalOutput) {
-        if (!el) return;
-        el.focus();
-        if (el.value !== undefined) {
-            const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
-            const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (nativeSetter) {
-                nativeSetter.call(el, finalOutput);
-            } else {
-                el.value = finalOutput;
-            }
-        } else {
-            el.innerText = finalOutput;
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    /**
-     * 读取 NodeSeek 编辑器（兼容摸鱼模式 textarea 与原生 CodeMirror）的当前文本
-     */
-    function getNodeSeekEditorText(targetEl) {
-        const moyuInput = getMoyuInputBox();
-        if (moyuInput && (targetEl === moyuInput || !targetEl)) {
-            return moyuInput.value !== undefined ? moyuInput.value : (moyuInput.innerText || '');
-        }
-        if (targetEl && targetEl.tagName === 'TEXTAREA') {
-            return targetEl.value || '';
-        }
-        const cmEl = document.querySelector('.CodeMirror');
-        if (cmEl && cmEl.CodeMirror) {
-            return cmEl.CodeMirror.getValue() || '';
-        }
-        const codeLines = document.querySelectorAll('.CodeMirror-code .CodeMirror-line');
-        if (codeLines && codeLines.length > 0) {
-            return Array.from(codeLines).map(line => line.innerText.replace(/\u200B/g, '')).join('\n');
-        }
-        const ta = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
-        return ta ? ta.value : '';
-    }
-
-    const siteConfigs = {
-        v2ex: {
-            match: () => location.hostname.includes('v2ex.com'),
-            title: () => {
-                if (getMoyuInputBox()) return getMoyuContext().title;
-                return document.querySelector('.header h1')?.innerText || document.title;
-            },
-            content: () => {
-                if (getMoyuInputBox()) return getMoyuContext().content;
-                return document.querySelector('.topic_content')?.innerText || '';
-            },
-            replies: () => {
-                if (getMoyuInputBox()) return getMoyuContext().replies;
-                return Array.from(document.querySelectorAll('.reply_content')).slice(0, 5).map(el => el.innerText.trim()).join(' | ');
-            },
-            getMountTargets: () => {
-                const targets = [];
-                const moyuInput = getMoyuInputBox();
-                if (moyuInput) targets.push(moyuInput);
-                const nativeEl = document.querySelector('#reply_content');
-                if (nativeEl && nativeEl.offsetParent !== null && !targets.includes(nativeEl)) {
-                    targets.push(nativeEl);
-                }
-                return targets;
-            },
-            detectFloorTarget: (targetEl) => {
-                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
-                    return detectMoyuFloorTarget(targetEl);
-                }
-                const el = targetEl || document.querySelector('#reply_content');
-                const val = el ? el.value : '';
-                const match = val.match(/^(@([a-zA-Z0-9_-]+)(?:\s+#(\d+))?\s*)/);
-                if (!match) return null;
-
-                const prefix = match[1].trim() + ' ';
-                const username = match[2];
-                const floorNo = match[3];
-                let floorContent = '';
-
-                const cells = Array.from(document.querySelectorAll('.cell[id^="r_"]'));
-                if (floorNo) {
-                    const targetCell = cells.find(c => c.querySelector('.no')?.innerText?.trim() === floorNo);
-                    if (targetCell) floorContent = targetCell.querySelector('.reply_content')?.innerText?.trim() || '';
-                }
-                if (!floorContent && username) {
-                    const userCells = cells.filter(c => c.querySelector('strong a.dark')?.innerText?.trim() === username);
-                    if (userCells.length > 0) {
-                        floorContent = userCells[userCells.length - 1].querySelector('.reply_content')?.innerText?.trim() || '';
-                    }
-                }
-                if (!floorContent && lastClickedFloor.user === username) {
-                    floorContent = lastClickedFloor.content;
+            try {
+                const bodyParams = new URLSearchParams();
+                bodyParams.append('raw', cleanPostContent);
+                bodyParams.append('topic_id', String(topicId));
+                if (replyToPostNumber) {
+                    bodyParams.append('reply_to_post_number', String(replyToPostNumber));
                 }
 
-                return {
-                    isFloorReply: true,
-                    prefixToKeep: prefix,
-                    targetUser: username,
-                    targetFloor: floorNo || '',
-                    targetContent: floorContent || `(用户 @${username} 的发言)`
-                };
-            },
-            fillText: (text, targetEl, prefixToKeep = '') => {
-                const el = targetEl || getMoyuInputBox() || document.querySelector('#reply_content');
-                fillControlledInput(el, prefixToKeep + text);
-            },
-            persona: 'V2EX资深程序员老哥，懂技术、说话直接、有逻辑、不讲客套话'
-        },
-        linuxdo: {
-            match: () => location.hostname.includes('linux.do'),
-            title: () => {
-                if (getMoyuInputBox()) return getMoyuContext().title;
-                return document.querySelector('.fancy-title, #topic-title h1')?.innerText?.trim() || document.title;
-            },
-            content: () => {
-                if (getMoyuInputBox()) return getMoyuContext().content;
-                return document.querySelector('article#post_1 .cooked, .topic-post:first-child .cooked')?.innerText?.trim() || '';
-            },
-            replies: () => {
-                if (getMoyuInputBox()) return getMoyuContext().replies;
-                return Array.from(document.querySelectorAll('article .cooked')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
-            },
-            getMountTargets: () => {
-                const targets = [];
-                const moyuInput = getMoyuInputBox();
-                if (moyuInput) targets.push(moyuInput);
-                const discourseInput = document.querySelector('textarea.d-editor-input');
-                if (discourseInput && discourseInput.offsetParent !== null && !targets.includes(discourseInput)) {
-                    targets.push(discourseInput);
-                }
-                return targets;
-            },
-            detectFloorTarget: (targetEl) => {
-                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
-                    return detectMoyuFloorTarget(targetEl);
-                }
-                const val = targetEl ? targetEl.value : '';
-                const quoteMatch = val.match(/^(\[quote="([^,"]+)[^"]*?"\][\s\S]*?\[\/quote\]\s*)/i);
-                if (quoteMatch) {
-                    return {
-                        isFloorReply: true,
-                        prefixToKeep: quoteMatch[1],
-                        targetUser: quoteMatch[2],
-                        targetFloor: '',
-                        targetContent: quoteMatch[1].replace(/\[\/?quote[^\]]*\]/gi, '').trim()
-                    };
-                }
-                const replyToUserEl = document.querySelector('#reply-control .reply-details .user-link, #reply-control .composer-action-title .user-link');
-                if (replyToUserEl) {
-                    const username = replyToUserEl.innerText.trim();
-                    let floorContent = lastClickedFloor.user === username ? lastClickedFloor.content : '';
-                    if (!floorContent) {
-                        const posts = Array.from(document.querySelectorAll('article.topic-post'));
-                        const matched = posts.filter(p => p.innerText.includes(username)).pop();
-                        if (matched) floorContent = matched.querySelector('.cooked')?.innerText?.trim() || '';
-                    }
-                    return {
-                        isFloorReply: true,
-                        prefixToKeep: '',
-                        targetUser: username,
-                        targetFloor: lastClickedFloor.floorNum || '',
-                        targetContent: floorContent || `(佬友 @${username} 的发言)`
-                    };
-                }
-                return null;
-            },
-            fillText: (text, targetEl, prefixToKeep = '') => {
-                const el = targetEl || getMoyuInputBox() || document.querySelector('textarea.d-editor-input');
-                fillControlledInput(el, prefixToKeep + text);
-            },
-            persona: 'Linux.do (L站) 资深开源与AI技术社区佬友，懂AI大模型、Docker、自建服务、网络与开发，称呼坛友为“佬”或“佬友”，说话真诚接地气，常用“感谢大佬分享”、“太强了佬”、“前排支持”等社区用语'
-        },
-        nodeseek: {
-            match: () => location.hostname.includes('nodeseek.com'),
-            title: () => {
-                if (getMoyuInputBox()) return getMoyuContext().title;
-                return document.querySelector('.post-title h1, .nsk-post h1, h1')?.innerText || document.title;
-            },
-            content: () => {
-                if (getMoyuInputBox()) return getMoyuContext().content;
-                return document.querySelector('article.post-content, .post-content')?.innerText || '';
-            },
-            replies: () => {
-                if (getMoyuInputBox()) return getMoyuContext().replies;
-                return Array.from(document.querySelectorAll('article.post-content, .post-content')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
-            },
-            getMountTargets: () => {
-                const targets = [];
-                const moyuInput = getMoyuInputBox();
-                if (moyuInput) targets.push(moyuInput);
-
-                const nativeEl = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
-                if (nativeEl && nativeEl.offsetParent !== null && !targets.includes(nativeEl)) {
-                    targets.push(nativeEl);
-                }
-                return targets;
-            },
-            detectFloorTarget: (targetEl) => {
-                if (getMoyuInputBox() && targetEl === getMoyuInputBox()) {
-                    return detectMoyuFloorTarget(targetEl);
-                }
-                const rawVal = getNodeSeekEditorText(targetEl);
-                if (!rawVal || !rawVal.trim()) return null;
-
-                const atMatch = rawVal.match(/^((?:@[^\s#]+|\[@[^\]]+\]\([^\)]+\))(?:\s*#(\d+))?\s*)/);
-                const quoteLines = rawVal.match(/^((?:>[^\n]*\n?)+)\s*/);
-
-                if (!atMatch && !quoteLines) return null;
-
-                let prefix = '';
-                let floorNo = '';
-                let username = '';
-                let floorContent = '';
-
-                if (quoteLines) {
-                    prefix = quoteLines[0].trim() + '\n\n';
-                    floorContent = quoteLines[1].replace(/^>\s*/gm, '').trim();
-                } else if (atMatch) {
-                    prefix = atMatch[1].trim() + ' ';
-                    floorNo = atMatch[2] || '';
-                    const uMatch = atMatch[1].match(/@([^\s#\]]+)/);
-                    username = uMatch ? uMatch[1] : '';
-                }
-
-                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content'));
-
-                if (!floorContent && floorNo) {
-                    const idx = parseInt(floorNo, 10);
-                    const floorLink = document.querySelector(`a[href$="#${floorNo}"], a[href*="#post-${floorNo}"]`);
-                    const container = floorLink ? floorLink.closest('.content-item, .comment-item, li, .nsk-post') : null;
-                    if (container) {
-                        floorContent = container.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
-                    }
-                    if (!floorContent && idx > 0 && allArticles[idx]) {
-                        floorContent = allArticles[idx].innerText.trim();
-                    }
-                }
-
-                if (!floorContent && username) {
-                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item'));
-                    const matchedItem = items.filter(item => item.innerText.includes(username)).pop();
-                    if (matchedItem) {
-                        floorContent = matchedItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
-                    }
-                }
-
-                if (!floorContent && (Date.now() - lastClickedFloor.timestamp < 120000)) {
-                    floorContent = lastClickedFloor.content;
-                }
-
-                return {
-                    isFloorReply: true,
-                    prefixToKeep: prefix,
-                    targetUser: username || lastClickedFloor.user || '层主',
-                    targetFloor: floorNo || lastClickedFloor.floorNum || '',
-                    targetContent: floorContent || `(层主 @${username} 的发言)`
-                };
-            },
-            fillText: (text, targetEl, prefixToKeep = '') => {
-                const finalOutput = prefixToKeep + text;
-                const moyuInput = getMoyuInputBox();
-
-                if (moyuInput && (targetEl === moyuInput || !targetEl?.classList?.contains('CodeMirror'))) {
-                    fillControlledInput(moyuInput, finalOutput);
-                    return;
-                }
-
-                const cmEl = (targetEl && targetEl.classList?.contains('CodeMirror')) ? targetEl : document.querySelector('.CodeMirror');
-                if (cmEl && cmEl.CodeMirror) {
-                    cmEl.CodeMirror.setValue(finalOutput);
-                    cmEl.CodeMirror.focus();
-                    cmEl.CodeMirror.setCursor(cmEl.CodeMirror.lineCount(), 0);
-                    return;
-                }
-
-                const hiddenTa = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
-                if (hiddenTa) {
-                    hiddenTa.focus();
-                    document.execCommand('selectAll', false, null);
-                    const dt = new DataTransfer();
-                    dt.setData('text/plain', finalOutput);
-                    hiddenTa.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-
-                    setTimeout(() => {
-                        if (!hiddenTa.value && (!cmEl || !cmEl.innerText.includes(text.slice(0, 5)))) {
-                            hiddenTa.value = finalOutput;
-                            hiddenTa.dispatchEvent(new Event('input', { bubbles: true }));
-                        }
-                    }, 100);
-                }
-            },
-            persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区常用词（如：bd、绑定、好鸡、早收、溢价、灵车、分母、吃码等，注意严禁使用“富哥”一词）'
-        },
-        discuz: {
-            match: () => true,
-            title: () => document.querySelector('#thread_subject')?.innerText || document.querySelector('h1')?.innerText || document.title,
-            content: () => {
-                const firstPost = document.querySelector('td[id^="postmessage_"], .t_f, .message');
-                return firstPost ? firstPost.innerText : '';
-            },
-            replies: () => {
-                return Array.from(document.querySelectorAll('td[id^="postmessage_"], .t_f')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
-            },
-            getMountTargets: () => {
-                const selectors = [
-                    '#fastpostmessage',
-                    '#fwin_reply #postmessage',
-                    '#postmessage',
-                    '#e_textarea',
-                    '#needmessage',
-                    'textarea[name="message"]'
-                ];
-                const uniqueTargets = new Set();
-                selectors.forEach(sel => {
-                    document.querySelectorAll(sel).forEach(el => uniqueTargets.add(el));
+                const res = await origFetch('/posts', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-CSRF-Token': csrfToken,
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: bodyParams.toString()
                 });
-                return Array.from(uniqueTargets);
-            },
-            detectFloorTarget: (targetEl) => {
-                const inPopup = targetEl && targetEl.closest('#fwin_reply');
-                const quoteBlock = (inPopup ? inPopup.querySelector('blockquote') : null) || document.querySelector('#fwin_reply blockquote, #postform blockquote, .quote blockquote');
-                if (quoteBlock && targetEl && targetEl.id !== 'fastpostmessage') {
-                    return {
-                        isFloorReply: true,
-                        prefixToKeep: '',
-                        targetUser: '该层主',
-                        targetFloor: '',
-                        targetContent: quoteBlock.innerText.trim()
-                    };
-                }
-                const val = targetEl ? targetEl.value : '';
-                const bbcodeMatch = val.match(/^(\[quote\][\s\S]*?\[\/quote\]\s*)/i);
-                if (bbcodeMatch) {
-                    return {
-                        isFloorReply: true,
-                        prefixToKeep: bbcodeMatch[1],
-                        targetUser: '该层主',
-                        targetFloor: '',
-                        targetContent: bbcodeMatch[1].replace(/\[\/?quote\]/gi, '').trim()
-                    };
-                }
-                return null;
-            },
-            fillText: (text, targetEl, prefixToKeep = '') => {
-                const finalOutput = prefixToKeep + text;
-                const eIframe = document.querySelector('#e_iframe');
-                if (targetEl && targetEl.id === 'e_textarea' && eIframe && eIframe.contentDocument && eIframe.contentDocument.body) {
-                    eIframe.contentDocument.body.innerText = finalOutput;
-                }
-                if (targetEl) {
-                    targetEl.value = finalOutput;
-                    targetEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    targetEl.dispatchEvent(new Event('change', { bubbles: true }));
-                    targetEl.focus();
-                }
-            },
-            persona: () => {
-                if (location.hostname.includes('right.com.cn')) {
-                    return '恩山无线论坛(Right.com.cn)硬核数码与网络玩家，精通路由器刷机、OpenWrt、光猫改桥接、组网与固件编译，说话实在接地气，常用“思考”、“紫薯布丁”、“老哥稳”、“感谢分享”等社区用语';
-                }
-                return '论坛常驻老哥，语气熟稔自然，像真人坛友一样交流';
-            }
-        }
-    };
 
-    const replyModes = [
-        {
-            label: '🍗 摸鱼黑话 (2~6字)',
-            type: 'short',
-            maxTokens: 512,
-            rulesForOP: `
-1. 你正在【直接回复楼主（主楼）】，这是纯水贴拿积分/思考/鸡腿模式，字数控制在 2~8 个字！
-2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、太强了佬、思考一下、老哥稳、帮顶、bd、好鸡早收、分母来了）。
-3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要包含 @用户名，只输出最终回复的那几个字！`,
-            rulesForFloor: `
-1. 你正在【直接回应某位层主】，字数控制在 2~10 个字！
-2. 针对【你正在直接回应的层主发言】，用极简的一两个词附和、接梗、赞同或调侃他（例如：老哥真相了、确实如此、同感、扎心了、借您吉言、哈哈真实、+1）。
-3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要自己输出 @用户名（系统会自动加），只输出回复正文那几个字！`
-        },
-        {
-            label: '💬 简短互动 (40字左右)',
-            type: 'medium',
-            maxTokens: 1024,
-            rulesForOP: `
-1. 你正在【直接回复楼主（主楼）】，针对主楼内容，用一两句自然的大白话发表看法、吐槽、补充经验或互动。
-2. 字数控制在 25~55 个字左右（约一到两句话），必须把整句话的逻辑和意思表达完整，绝对不能话说到一半断掉！
-3. 语气要像真人坛友日常敲字交流，口语化、接地气，严禁出现“富哥”、“总的来说”、“确实”、“希望”、“首先”等词。绝不要包含 @用户名，只输出回复正文！`,
-            rulesForFloor: `
-1. 你正在【直接与某位层主对话/对线】！请把注意力 100% 集中在【你正在直接回应的层主发言】上（主楼内容仅作背景参考）。
-2. 顺着这位层主的话进行回应（赞同补充、解答他的疑问、反驳他的观点或顺着吐槽），字数控制在 20~50 个字左右，必须把话完整说完，绝不断句！
-3. 语气要像真人坛友在楼层里直接跟人搭话，自然口语化，严禁出现“富哥”二字，严禁在开头自己写 @用户名（系统已自带前缀），只输出纯回复正文！`
-        },
-        {
-            label: '🧐 详细分析 (完整深度回复)',
-            type: 'long',
-            maxTokens: 2048,
-            rulesForOP: `
-1. 你正在【直接回复楼主（主楼）】，针对主楼的问题、方案、教程或分享，给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！
-2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“富哥”、“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种套话。
-3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），只输出回复正文！`,
-            rulesForFloor: `
-1. 你正在【深度回应/解答某位层主的观点或追问】！请重点针对【你正在直接回应的层主发言】展开深度分析、技术探讨、细节补充或有理有据的反驳，结合主楼背景把道理讲透，字数控制在 100~300 字左右，严禁半途截断！
-2. 保持论坛资深技术老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“富哥”、“首先、其次、最后、综上所述”等套话，也不要使用 Markdown 加粗符号（**）。
-3. 严禁在开头自己输出 @用户名（系统已保留前缀），只输出纯回复正文！`
-        }
-    ];
+                const data = await res.json();
+                sendBtn.innerText = '发送';
+                sendBtn.disabled = false;
 
-    function getCurrentSite() {
-        if (siteConfigs.v2ex.match()) return siteConfigs.v2ex;
-        if (siteConfigs.linuxdo.match()) return siteConfigs.linuxdo;
-        if (siteConfigs.nodeseek.match()) return siteConfigs.nodeseek;
-        return siteConfigs.discuz;
-    }
-
-    /**
-     * 实时更新按钮栏左侧的“当前回复模式指示器”（【📢 当前：回楼主】 vs 【🎯 当前：回层主 @xxx】）
-     */
-    function updateModeBarStatus() {
-        const site = getCurrentSite();
-        document.querySelectorAll('.gemini-target-badge').forEach(badge => {
-            const targetEl = badge._boundTarget;
-            const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
-            if (floorInfo && floorInfo.isFloorReply) {
-                const tag = floorInfo.targetFloor ? ` #${floorInfo.targetFloor}` : '';
-                badge.innerText = `🎯 当前：回层主 ${floorInfo.targetUser}${tag}`;
-                badge.style.background = '#1e3a2f';
-                badge.style.color = '#6ee7b7';
-                badge.style.borderColor = '#059669';
-            } else {
-                badge.innerText = '📢 当前：回楼主';
-                badge.style.background = '#1e1f22';
-                badge.style.color = '#949ba4';
-                badge.style.borderColor = '#4e5058';
-            }
-        });
-    }
-
-    function initButtons() {
-        const site = getCurrentSite();
-        const targets = site.getMountTargets();
-        if (!targets || targets.length === 0) return;
-
-        let mountedNew = false;
-
-        targets.forEach(target => {
-            if (!target || target.dataset.geminiMounted === 'true') return;
-            target.dataset.geminiMounted = 'true';
-            mountedNew = true;
-
-            target.addEventListener('input', updateModeBarStatus);
-            target.addEventListener('keyup', updateModeBarStatus);
-
-            const bar = document.createElement('div');
-            bar.className = 'gemini-btn-bar';
-            bar.style.cssText = 'width: 100%; box-sizing: border-box; margin: 4px 0 6px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; z-index: 9999; text-align: left; flex-shrink: 0;';
-
-            // 0. 创建“回楼主 / 回层主”状态指示标签
-            const badge = document.createElement('span');
-            badge.className = 'gemini-target-badge';
-            badge._boundTarget = target;
-            badge.innerText = '📢 当前：回楼主';
-            badge.title = '当输入框内有 @用户名 #楼层 或在回复小窗中时，自动切换为针对层主发言生成回复';
-            badge.style.cssText = 'padding: 3px 8px; background: #1e1f22; color: #949ba4; border: 1px solid #4e5058; border-radius: 4px; font-size: 12px; line-height: 1.4; user-select: none;';
-            bar.appendChild(badge);
-
-            // 1. 创建三档回复按钮
-            replyModes.forEach(mode => {
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.innerText = mode.label;
-                btn.style.cssText = 'padding: 4px 10px; background: #2b2d31; color: #e3e5e8; border: 1px solid #4e5058; border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1.4; transition: 0.2s;';
-                btn.onmouseover = () => { btn.style.background = '#404249'; };
-                btn.onmouseout = () => { btn.style.background = '#2b2d31'; };
-                btn.onclick = (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const selectedModel = GM_getValue("GEMINI_MODEL", DEFAULT_MODEL);
-                    generateReply(site, mode, btn, target, selectedModel, new Set());
-                };
-                bar.appendChild(btn);
-            });
-
-            // 2. 创建实时模型选择下拉框
-            const modelSelect = document.createElement('select');
-            modelSelect.className = 'gemini-model-select';
-            modelSelect.title = '选择 Gemini 模型（列表通过官方 API 自动更新，支持额度耗尽自动切换）';
-            modelSelect.style.cssText = 'padding: 3px 6px; background: #1e1f22; color: #b5bac1; border: 1px solid #4e5058; border-radius: 4px; font-size: 12px; height: 26px; cursor: pointer; outline: none; max-width: 250px;';
-            modelSelect.onchange = () => {
-                GM_setValue("GEMINI_MODEL", modelSelect.value);
-                syncAllModelSelects();
-            };
-            bar.appendChild(modelSelect);
-
-            // 3. 创建手动刷新模型按钮
-            const refreshBtn = document.createElement('button');
-            refreshBtn.className = 'gemini-model-refresh-btn';
-            refreshBtn.type = 'button';
-            refreshBtn.innerText = '🔄';
-            refreshBtn.title = '从 Google 官方接口实时同步最新可用模型';
-            refreshBtn.style.cssText = 'padding: 3px 7px; background: #1e1f22; color: #b5bac1; border: 1px solid #4e5058; border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1.4;';
-            refreshBtn.onclick = (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                fetchOfficialModels(true, true);
-            };
-            bar.appendChild(refreshBtn);
-
-            const parent = target.parentNode;
-            if (parent) {
-                const parentStyle = window.getComputedStyle(parent);
-                const isMoyu = (target === getMoyuInputBox());
-                const isDiscourse = target.classList?.contains('d-editor-input');
-
-                if (isMoyu || isDiscourse || (parentStyle.display.includes('flex') && parentStyle.flexDirection === 'row')) {
-                    parent.style.display = 'flex';
-                    parent.style.flexDirection = 'column';
-                    parent.style.alignItems = 'stretch';
-                    target.style.width = '100%';
-                    target.style.boxSizing = 'border-box';
-                }
-                parent.insertBefore(bar, target);
-            }
-        });
-
-        if (mountedNew) {
-            syncAllModelSelects();
-            fetchOfficialModels(false, false);
-        }
-        updateModeBarStatus();
-    }
-
-    function cleanOutput(text, type) {
-        let cleaned = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
-        cleaned = cleaned.replace(/^@[a-zA-Z0-9_\u4e00-\u9fa5-]+(?:\s+#\d+)?[,，:：\s]+/, '');
-        if (type === 'short') {
-            cleaned = cleaned.replace(/[。！!~～]+$/g, '').replace(/\n+/g, ' ');
-        } else if (type === 'medium') {
-            cleaned = cleaned.replace(/\n+/g, ' ').replace(/\*\*/g, '').replace(/[。]+$/g, '');
-        } else {
-            cleaned = cleaned.replace(/\*\*/g, '').replace(/^#+\s*/gm, '');
-        }
-        return cleaned.trim();
-    }
-
-    function getNextAvailableModel(triedModels) {
-        const allModels = getAvailableModels();
-        for (const m of allModels) {
-            if (!triedModels.has(m.id)) {
-                return m.id;
-            }
-        }
-        return null;
-    }
-
-    function generateReply(site, mode, btn, targetEl, modelId, triedModels) {
-        const apiKey = GM_getValue("GEMINI_API_KEY", "");
-        if (!apiKey) {
-            alert("请先点击浏览器右上角油猴插件图标 -> 点击【🔑 1. 设置 Gemini API Key】");
-            return;
-        }
-
-        triedModels.add(modelId);
-
-        const title = site.title() || '无标题';
-        const contentLimit = mode.type === 'long' ? 2500 : 1000;
-        const content = (site.content() || '无正文内容').slice(0, contentLimit);
-        const replies = (site.replies() || '暂无回复').slice(0, 500);
-        const personaText = typeof site.persona === 'function' ? site.persona() : site.persona;
-
-        const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
-        let fullPrompt = '';
-        let prefixToKeep = '';
-
-        if (floorInfo && floorInfo.isFloorReply) {
-            prefixToKeep = floorInfo.prefixToKeep || '';
-            fullPrompt = `你现在的身份是：${personaText}。
-注意：你现在【不是在回复楼主】，而是在楼层中【直接回应层主 ${floorInfo.targetUser} ${floorInfo.targetFloor ? '(' + floorInfo.targetFloor + '楼)' : ''}】！
-请严格遵守以下规则：${mode.rulesForFloor}
-
-【你正在直接回应的层主发言（核心焦点，请直接针对这句话进行回复）】：
-"${floorInfo.targetContent}"
-
-【原帖背景参考（仅作上下文了解，切勿跑题去回楼主）】：
-帖子标题：${title}
-主楼摘要：${content.slice(0, 500)}`;
-        } else {
-            fullPrompt = `你现在的身份是：${personaText}。
-你现在正在【直接回复楼主（主楼）】。请根据以下论坛帖子内容生成一条自然回帖，严格遵守以下规则：${mode.rulesForOP}
-
-【帖子标题】：${title}
-【主楼内容】：${content}
-【前排网友回复队形参考】：${replies}`;
-        }
-
-        if (triedModels.size === 1) {
-            btn.dataset.origText = btn.innerText;
-            btn.innerText = floorInfo?.isFloorReply ? '⏳ 回层主中...' : '⏳ 思考中...';
-        } else {
-            btn.innerText = `🔄 负载至 ${modelId.replace('gemini-', '')}...`;
-        }
-        btn.disabled = true;
-
-        const genConfig = {
-            temperature: mode.type === 'long' ? 0.75 : 0.85,
-            maxOutputTokens: mode.maxTokens
-        };
-        if (modelId.includes('2.5-flash') && !modelId.includes('lite')) {
-            genConfig.thinkingConfig = { thinkingBudget: 0 };
-        }
-
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`,
-            headers: { "Content-Type": "application/json" },
-            data: JSON.stringify({
-                contents: [{ parts: [{ text: fullPrompt }] }],
-                safetySettings: [
-                    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-                ],
-                generationConfig: genConfig
-            }),
-            onload: function(response) {
-                try {
-                    const data = JSON.parse(response.responseText);
-
-                    if (data.error) {
-                        const errCode = data.error.code;
-                        if (errCode === 429 || errCode === 404 || errCode === 503 || errCode === 400) {
-                            const nextModel = getNextAvailableModel(triedModels);
-                            if (nextModel && triedModels.size <= 4) {
-                                console.warn(`[Gemini负载均衡] 模型 ${modelId} 不可用 (Code ${errCode})，自动切换至备用模型: ${nextModel}`);
-                                GM_setValue("GEMINI_MODEL", nextModel);
-                                syncAllModelSelects();
-                                generateReply(site, mode, btn, targetEl, nextModel, triedModels);
-                                return;
-                            }
-                        }
-                        btn.innerText = btn.dataset.origText;
-                        btn.disabled = false;
-                        alert(`Gemini API 报错 (${data.error.code}) [已尝试模型: ${Array.from(triedModels).join(' -> ')}]:\n${data.error.message}`);
-                        return;
-                    }
-
-                    btn.innerText = btn.dataset.origText;
-                    btn.disabled = false;
-
-                    if (data.promptFeedback && data.promptFeedback.blockReason) {
-                        alert(`内容被 Gemini 拦截，原因: ${data.promptFeedback.blockReason}`);
-                        return;
-                    }
-
-                    const candidate = data.candidates && data.candidates[0];
-                    if (!candidate) {
-                        alert("未生成有效内容，请检查帖子内容是否空白。");
-                        return;
-                    }
-
-                    const parts = candidate.content && candidate.content.parts;
-                    if (!parts || parts.length === 0) {
-                        alert(`生成中止，原因: ${candidate.finishReason || 'UNKNOWN'}`);
-                        return;
-                    }
-
-                    const textPart = parts.filter(p => !p.thought && p.text).pop() || parts[parts.length - 1];
-                    let replyText = textPart ? textPart.text : '';
-
-                    if (!replyText) {
-                        alert("生成的回复文本为空，请重试。");
-                        return;
-                    }
-
-                    replyText = cleanOutput(replyText, mode.type);
-                    site.fillText(replyText, targetEl, prefixToKeep);
+                if (res.ok && data.id) {
+                    ta.value = '';
+                    lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
                     updateModeBarStatus();
-                } catch (e) {
-                    btn.innerText = btn.dataset.origText;
-                    btn.disabled = false;
-                    console.error("Parse Error:", e, response.responseText);
-                    alert("解析响应失败，请检查网络代理是否正常。");
-                }
-            },
-            onerror: function() {
-                btn.innerText = btn.dataset.origText;
-                btn.disabled = false;
-                alert("请求失败，请检查代理网络是否放行了 generativelanguage.googleapis.com");
-            }
-        });
-    }
-
-    setInterval(initButtons, 800);
-})();
+                    showToast(`✅ Linux.do 回帖成功！(楼层 #${data.post_number})`);
+                } else {
+                    const errMsg = data.errors ? data.errors.join('\n') : '发帖失败，请检查字数或发帖频率限制';
+                    showToast(`⚠️ Linux.do 回帖失败：${errMsg}`, true);
