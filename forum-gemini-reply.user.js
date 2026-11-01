@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Discuz全系列)
+// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek++摸鱼模式 / Discuz全系列)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.6.1
-// @description  全站支持“回层主 vs 回楼主”智能区分与@前缀保留 + 恩山等DZ小窗多点挂载 + 官方接口同步模型 + 429自动负载均衡
+// @version      3.7.0
+// @description  完美适配NodeSeek++摸鱼模式(仿微信界面) + 全站支持“回层主 vs 回楼主”智能区分 + 恩山等DZ小窗挂载 + 官方接口同步模型 + 429自动负载均衡
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
 // @updateURL    https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
 // @downloadURL  https://raw.githubusercontent.com/kylo1989/forum-gemini-reply/main/forum-gemini-reply.user.js
 // @match        *://*.v2ex.com/t/*
-// @match        *://*.nodeseek.com/post-*
+// @match        *://*.nodeseek.com/*
 // @match        *://*.right.com.cn/*
 // @match        *://*/*thread-*.html*
 // @match        *://*/*forum.php?mod=viewthread*
@@ -52,7 +52,7 @@
     });
 
     /**
-     * 全局监听“回复层主”按钮点击事件（适配 V2EX 和 NodeSeek 点击楼层回复按钮的瞬间抓取该层内容）
+     * 全局监听“回复层主”按钮点击事件（适配 V2EX、NodeSeek 原生及 NodeSeek++ 摸鱼模式）
      */
     document.addEventListener('click', (e) => {
         const target = e.target;
@@ -73,16 +73,23 @@
             }
         }
 
-        // 2. NodeSeek 点击某楼层的“回复 / 引用”按钮
+        // 2. NodeSeek (含原生页面与 nodeseek++ 摸鱼模式)
         if (location.hostname.includes('nodeseek.com')) {
-            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post');
+            // 如果在摸鱼模式点击了左侧会话列表切换帖子，清空上一次的层主缓存
+            if (target.closest('[class*="session"], [class*="chat-item"], [class*="topic-item"], [class*="conv-item"]')) {
+                lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
+                setTimeout(updateModeBarStatus, 200);
+                return;
+            }
+
+            const commentItem = target.closest('.content-item, .comment-item, li[id^="post-"], .nsk-post, [class*="message-item"], [class*="msg-item"], [class*="chat-msg"]');
             const btnText = (target.innerText || target.title || '').trim();
-            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"]');
+            const isReplyBtn = btnText.includes('回复') || btnText.includes('引用') || target.closest('.reply-btn, .quote-btn, [title*="回复"], [title*="引用"], [class*="reply"], [class*="quote"]');
             if (commentItem && isReplyBtn) {
-                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"]')?.innerText?.trim() || '';
-                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"]');
+                const user = commentItem.querySelector('.author-name, .username, a[href*="/space/"], [class*="nickname"], [class*="author"], [class*="user-name"]')?.innerText?.trim() || '';
+                const floorEl = commentItem.querySelector('.floor-link, .floor, [href*="#"], [class*="floor"]');
                 const floorNum = floorEl ? floorEl.innerText.replace(/[^\d]/g, '') : '';
-                const content = commentItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
+                const content = commentItem.querySelector('article.post-content, .post-content, [class*="bubble"], [class*="msg-content"], [class*="message-content"], [class*="text"]')?.innerText?.trim() || '';
                 if (content) {
                     lastClickedFloor = { user: user, floorNum: floorNum, content: content, timestamp: Date.now() };
                     setTimeout(updateModeBarStatus, 150);
@@ -206,14 +213,97 @@
     }
 
     /**
-     * 读取 NodeSeek CodeMirror 编辑器的当前文本内容
+     * 判断当前是否处于 nodeseek++ 的摸鱼模式（仿微信界面）
      */
-    function getNodeSeekEditorText() {
+    function getMoyuInputBox() {
+        // 摸鱼模式特征：placeholder 含有 "发送给 " 的 textarea 或 contenteditable 元素
+        const ta = document.querySelector('textarea[placeholder*="发送给"], input[placeholder*="发送给"], [contenteditable="true"][placeholder*="发送给"], [data-placeholder*="发送给"]');
+        if (ta && ta.offsetParent !== null) return ta;
+        return null;
+    }
+
+    /**
+     * 提取 nodeseek++ 摸鱼模式下的帖子标题与聊天流气泡内容
+     */
+    function getMoyuContext() {
+        const moyuInput = getMoyuInputBox();
+        let title = '';
+
+        // 1. 优先从输入框 placeholder "发送给 xxx" 中提取纯净标题
+        if (moyuInput) {
+            const ph = moyuInput.getAttribute('placeholder') || moyuInput.getAttribute('data-placeholder') || '';
+            if (ph.includes('发送给')) {
+                title = ph.replace(/^.*发送给\s*/, '').trim();
+            }
+        }
+
+        // 2. 尝试从聊天窗口顶部 Header 提取标题
+        if (!title) {
+            const headerEl = document.querySelector('[class*="chat-header"], [class*="main-header"], [class*="moyu"] header, [class*="wechat"] header');
+            if (headerEl) {
+                title = headerEl.innerText.replace(/\(\d+\)\s*$/, '').trim();
+            }
+        }
+
+        // 3. 抓取右侧聊天流里的所有消息气泡
+        let bubbles = [];
+        const bubbleSelectors = [
+            'article.post-content',
+            '.post-content',
+            '.markdown-body',
+            '[class*="bubble-content"]',
+            '[class*="msg-content"]',
+            '[class*="message-content"]',
+            '[class*="chat-content"]',
+            '[class*="msg-text"]'
+        ];
+
+        for (const sel of bubbleSelectors) {
+            const els = Array.from(document.querySelectorAll(sel)).filter(el => el.offsetParent !== null && el.innerText.trim().length > 0);
+            if (els.length > 0) {
+                bubbles = els.map(el => el.innerText.trim());
+                break;
+            }
+        }
+
+        // 兜底：若类名被混淆，通过遍历输入框上方同属右侧主面板的气泡卡片提取
+        if (bubbles.length === 0 && moyuInput) {
+            const rightPane = moyuInput.closest('[class*="main"], [class*="right"], [class*="chat"], [style*="flex"]');
+            if (rightPane) {
+                const msgItems = rightPane.querySelectorAll('[class*="item"], [class*="msg"], [class*="message"]');
+                msgItems.forEach(item => {
+                    if (item.contains(moyuInput)) return;
+                    const clone = item.cloneNode(true);
+                    // 移除时间戳和头像干扰
+                    clone.querySelectorAll('img, time, [class*="time"], [class*="avatar"]').forEach(n => n.remove());
+                    const txt = clone.innerText.trim().replace(/\n+/g, ' ');
+                    if (txt) bubbles.push(txt);
+                });
+            }
+        }
+
+        return {
+            title: title || document.title,
+            content: bubbles[0] || title || '无正文内容',
+            replies: bubbles.slice(1, 7).join(' | ')
+        };
+    }
+
+    /**
+     * 读取 NodeSeek 编辑器（兼容摸鱼模式 textarea 与原生 CodeMirror）的当前文本
+     */
+    function getNodeSeekEditorText(targetEl) {
+        const moyuInput = getMoyuInputBox();
+        if (moyuInput && (targetEl === moyuInput || !targetEl)) {
+            return moyuInput.value !== undefined ? moyuInput.value : (moyuInput.innerText || '');
+        }
+        if (targetEl && targetEl.tagName === 'TEXTAREA') {
+            return targetEl.value || '';
+        }
         const cmEl = document.querySelector('.CodeMirror');
         if (cmEl && cmEl.CodeMirror) {
             return cmEl.CodeMirror.getValue() || '';
         }
-        // 若 CodeMirror 实例未挂载到 DOM 属性，读取可视代码行文本
         const codeLines = document.querySelectorAll('.CodeMirror-code .CodeMirror-line');
         if (codeLines && codeLines.length > 0) {
             return Array.from(codeLines).map(line => line.innerText.replace(/\u200B/g, '')).join('\n');
@@ -278,15 +368,33 @@
         },
         nodeseek: {
             match: () => location.hostname.includes('nodeseek.com'),
-            title: () => document.querySelector('.post-title h1, .nsk-post h1, h1')?.innerText || document.title,
-            content: () => document.querySelector('article.post-content, .post-content')?.innerText || '',
-            replies: () => Array.from(document.querySelectorAll('article.post-content, .post-content')).slice(1, 6).map(el => el.innerText.trim()).join(' | '),
-            getMountTargets: () => {
-                const el = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
-                return el ? [el] : [];
+            title: () => {
+                if (getMoyuInputBox()) return getMoyuContext().title;
+                return document.querySelector('.post-title h1, .nsk-post h1, h1')?.innerText || document.title;
             },
-            detectFloorTarget: () => {
-                const rawVal = getNodeSeekEditorText();
+            content: () => {
+                if (getMoyuInputBox()) return getMoyuContext().content;
+                return document.querySelector('article.post-content, .post-content')?.innerText || '';
+            },
+            replies: () => {
+                if (getMoyuInputBox()) return getMoyuContext().replies;
+                return Array.from(document.querySelectorAll('article.post-content, .post-content')).slice(1, 6).map(el => el.innerText.trim()).join(' | ');
+            },
+            getMountTargets: () => {
+                const targets = [];
+                // 1. 优先检测 nodeseek++ 摸鱼模式输入框
+                const moyuInput = getMoyuInputBox();
+                if (moyuInput) targets.push(moyuInput);
+
+                // 2. 原生帖子页面的 CodeMirror 编辑器
+                const nativeEl = document.querySelector('.CodeMirror') || document.querySelector('#cm-editor-wrapper') || document.querySelector('.nsk-editor') || document.querySelector('.comment-box textarea');
+                if (nativeEl && nativeEl.offsetParent !== null && !targets.includes(nativeEl)) {
+                    targets.push(nativeEl);
+                }
+                return targets;
+            },
+            detectFloorTarget: (targetEl) => {
+                const rawVal = getNodeSeekEditorText(targetEl);
                 if (!rawVal || !rawVal.trim()) return null;
 
                 // 匹配 "@username #12 " 或 "[@username](/space/...) #12"
@@ -311,7 +419,7 @@
                     username = uMatch ? uMatch[1] : '';
                 }
 
-                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content'));
+                const allArticles = Array.from(document.querySelectorAll('article.post-content, .post-content, [class*="bubble-content"], [class*="msg-content"]'));
 
                 if (!floorContent && floorNo) {
                     const idx = parseInt(floorNo, 10);
@@ -326,10 +434,10 @@
                 }
 
                 if (!floorContent && username) {
-                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item'));
+                    const items = Array.from(document.querySelectorAll('.content-item, .comment-item, [class*="message-item"], [class*="msg-item"]'));
                     const matchedItem = items.filter(item => item.innerText.includes(username)).pop();
                     if (matchedItem) {
-                        floorContent = matchedItem.querySelector('article.post-content, .post-content')?.innerText?.trim() || '';
+                        floorContent = matchedItem.querySelector('article.post-content, .post-content, [class*="bubble"], [class*="content"]')?.innerText?.trim() || '';
                     }
                 }
 
@@ -347,13 +455,39 @@
             },
             fillText: (text, targetEl, prefixToKeep = '') => {
                 const finalOutput = prefixToKeep + text;
-                const cmEl = document.querySelector('.CodeMirror');
+                const moyuInput = getMoyuInputBox();
+
+                // 方案0：如果当前是 nodeseek++ 摸鱼模式的输入框（标准 textarea / input 或 contenteditable）
+                const activeBox = (targetEl && (targetEl === moyuInput || targetEl.tagName === 'TEXTAREA' || targetEl.tagName === 'INPUT')) ? targetEl : moyuInput;
+                if (activeBox && !activeBox.closest('.CodeMirror')) {
+                    activeBox.focus();
+                    if (activeBox.value !== undefined) {
+                        // 兼容 React / Vue 受控组件的原生 value setter
+                        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set ||
+                                             Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (nativeSetter) {
+                            nativeSetter.call(activeBox, finalOutput);
+                        } else {
+                            activeBox.value = finalOutput;
+                        }
+                    } else {
+                        activeBox.innerText = finalOutput;
+                    }
+                    activeBox.dispatchEvent(new Event('input', { bubbles: true }));
+                    activeBox.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                }
+
+                // 方案1：原生页面 CodeMirror 实例写入
+                const cmEl = (targetEl && targetEl.classList?.contains('CodeMirror')) ? targetEl : document.querySelector('.CodeMirror');
                 if (cmEl && cmEl.CodeMirror) {
                     cmEl.CodeMirror.setValue(finalOutput);
                     cmEl.CodeMirror.focus();
                     cmEl.CodeMirror.setCursor(cmEl.CodeMirror.lineCount(), 0);
                     return;
                 }
+
+                // 方案2：针对 CodeMirror 隐藏 textarea 模拟粘贴事件
                 const hiddenTa = document.querySelector('.CodeMirror textarea') || document.querySelector('textarea');
                 if (hiddenTa) {
                     hiddenTa.focus();
@@ -527,7 +661,6 @@
             target.dataset.geminiMounted = 'true';
             mountedNew = true;
 
-            // 监听输入框变化，实时更新“回楼主/回层主”状态徽章
             target.addEventListener('input', updateModeBarStatus);
             target.addEventListener('keyup', updateModeBarStatus);
 
@@ -598,7 +731,6 @@
 
     function cleanOutput(text, type) {
         let cleaned = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
-        // 防止 AI 自己又重复写了一遍 @username 开头
         cleaned = cleaned.replace(/^@[a-zA-Z0-9_\u4e00-\u9fa5-]+(?:\s+#\d+)?[,，:：\s]+/, '');
         if (type === 'short') {
             cleaned = cleaned.replace(/[。！!~～]+$/g, '').replace(/\n+/g, ' ');
@@ -635,7 +767,6 @@
         const replies = (site.replies() || '暂无回复').slice(0, 500);
         const personaText = typeof site.persona === 'function' ? site.persona() : site.persona;
 
-        // 核心逻辑：检测当前是“回复层主”还是“回复楼主”
         const floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
         let fullPrompt = '';
         let prefixToKeep = '';
