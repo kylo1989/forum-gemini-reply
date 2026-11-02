@@ -2,6 +2,9 @@
 
 基于 Google Gemini API (`gemini-2.5-flash`) 的油猴（Tampermonkey）智能回帖脚本。专为 **NodeSeek**、**V2EX** 以及各类 **Discuz!** 论坛打造，自动读取主楼内容与前排楼层队形，告别浓重的“AI 客服味”。
 
+[![Version](https://img.shields.io/github/v/tag/kylo1989/forum-gemini-reply?label=version&color=blue)](https://github.com/kylo1989/forum-gemini-reply/releases)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/kylo1989/forum-gemini-reply/blob/main/LICENSE)
+
 ## ✨ 核心特性
 
 - **三档梯度自由切换**：
