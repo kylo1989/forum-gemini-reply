@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Linux.do / Discuz)
+// @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Linux.do / 草榴 / Discuz)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      3.9.1
-// @description  彻底修复沙箱语法错误 + 修复NS摸鱼模式回帖激活 + 为Linux.do摸鱼模式自动补全底部回复框 + 回层主/回楼主区分 + 429自动负载均衡
+// @version      4.0.0
+// @description  新增草榴社区(t66y)深度适配与1024老司机人设 + 全面适配 V2EX/Linux.do/NodeSeek 摸鱼与原生模式 + 恩山等DZ论坛 + 回层主/回楼主区分 + 429自动负载均衡
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
@@ -11,6 +11,9 @@
 // @match        *://*.v2ex.com/*
 // @match        *://*.nodeseek.com/*
 // @match        *://*.linux.do/*
+// @match        *://*.t66y.com/*
+// @match        *://*/*htm_data/*.html*
+// @match        *://*/read.php*
 // @match        *://*.right.com.cn/*
 // @match        *://*/*thread-*.html*
 // @match        *://*/*forum.php?mod=viewthread*
@@ -98,7 +101,6 @@
 
     function extractLinuxDoTopicIdFromDOM() {
         if (currentMoyuTopicId) return currentMoyuTopicId;
-        // 1. 尝试从当前激活的左侧列表项或页面内的 /t/ 链接提取
         var links = document.querySelectorAll('a[href*="/t/"]');
         for (var i = 0; i < links.length; i++) {
             var href = links[i].getAttribute('href') || '';
@@ -108,7 +110,6 @@
                 if (item) return m[1];
             }
         }
-        // 2. 尝试匹配当前右侧顶部标题文字与左侧列表项对应的标题
         var rightPane = getMoyuRightChatPane();
         var headerTitle = rightPane && rightPane.firstElementChild ? (rightPane.firstElementChild.innerText || '').replace(/\(\d+\)\s*$/, '').trim() : '';
         if (headerTitle) {
@@ -266,6 +267,15 @@
         return null;
     }
 
+    /**
+     * 判断当前是否为草榴社区 (t66y / PHPWind 架构)
+     */
+    function isT66ySite() {
+        if (location.hostname.indexOf('t66y.com') !== -1) return true;
+        if (document.querySelector('div.tpc_content') && document.querySelector('textarea[name="atc_content"]')) return true;
+        return false;
+    }
+
     document.addEventListener('click', function(e) {
         var target = e.target;
         if (!target || !target.closest) return;
@@ -370,6 +380,22 @@
                 } else {
                     lastClickedFloor = { user: '', floorNum: '', content: '', timestamp: 0 };
                     setTimeout(updateModeBarStatus, 250);
+                }
+            }
+        }
+
+        // 4. 草榴社区 (t66y) 点击楼层上方“引用 / 回复”按钮
+        if (isT66ySite()) {
+            var t66yRow = target.closest('div.t.t2, table.t2, tr.tr1');
+            var t66yLink = target.closest('a[href*="post.php?action=quote"], a[onclick*="reply"], a[title*="引用"], a[title*="回復"], a[title*="回复"]');
+            if (t66yRow && t66yLink) {
+                var tUserEl = t66yRow.querySelector('b, .r_two b, th b');
+                var tContentEl = t66yRow.querySelector('.tpc_content');
+                var tUser = tUserEl ? tUserEl.innerText.trim() : '层主';
+                var tContent = tContentEl ? tContentEl.innerText.trim() : '';
+                if (tContent) {
+                    lastClickedFloor = { user: tUser, floorNum: '', content: tContent, timestamp: Date.now() };
+                    setTimeout(updateModeBarStatus, 200);
                 }
             }
         }
@@ -638,9 +664,6 @@
         };
     }
 
-    /**
-     * 深度唤醒 Vue 3 / React 受控输入框（解决 NodeSeek 摸鱼模式下填入文字后发送不生效的问题）
-     */
     function fillControlledInput(el, finalOutput) {
         if (!el) return;
         el.focus();
@@ -992,6 +1015,94 @@
             },
             persona: 'NodeSeek (MJJ/主机圈) 资深玩家，熟悉VPS线路、网络优化、建站、硬件与折腾，说话接地气，善用社区常用词（如：bd、绑定、好鸡、早收、溢价、灵车、分母、吃码等，注意严禁使用“富哥”一词）'
         },
+        t66y: {
+            match: function() { return isT66ySite(); },
+            title: function() {
+                var h4 = document.querySelector('h4.f16') || document.querySelector('.tpc_content')?.closest('td')?.querySelector('h4');
+                if (h4 && h4.innerText.trim()) return h4.innerText.trim();
+                // 清理草榴网页 title 后缀（如 " - 達蓋爾的旗幟 - 草榴社區 - t66y.com"）
+                return document.title.replace(/\s*-\s*[^-]+-\s*草榴.*$/i, '').replace(/\s*\|\s*草榴.*$/i, '').trim();
+            },
+            content: function() {
+                var firstPost = document.querySelector('div.tpc_content');
+                if (!firstPost) return '';
+                var text = (firstPost.innerText || '').trim();
+                var imgCount = firstPost.querySelectorAll('img').length;
+                var linkCount = firstPost.querySelectorAll('a').length;
+                var mediaDesc = [];
+                if (imgCount > 0) mediaDesc.push('包含 ' + imgCount + ' 张图片/写真');
+                if (linkCount > 0) mediaDesc.push('包含 ' + linkCount + ' 个链接/种子特征码');
+                var prefix = mediaDesc.length > 0 ? '【主楼媒体信息：' + mediaDesc.join('，') + '】\n' : '';
+                return prefix + (text || '(主楼为纯图片/资源分享帖，请结合帖子标题与前排老哥评论进行回复)');
+            },
+            replies: function() {
+                var nodes = document.querySelectorAll('div.tpc_content');
+                var arr = [];
+                for (var i = 1; i < Math.min(8, nodes.length); i++) {
+                    var txt = (nodes[i].innerText || '').trim().replace(/\n+/g, ' ');
+                    if (txt && txt !== '1024') arr.push(txt);
+                }
+                return arr.join(' | ');
+            },
+            getMountTargets: function() {
+                var selectors = [
+                    'textarea[name="atc_content"]',
+                    '#atc_content'
+                ];
+                var targets = [];
+                for (var i = 0; i < selectors.length; i++) {
+                    var els = document.querySelectorAll(selectors[i]);
+                    for (var j = 0; j < els.length; j++) {
+                        if (els[j].offsetParent !== null && targets.indexOf(els[j]) === -1) {
+                            targets.push(els[j]);
+                        }
+                    }
+                }
+                return targets;
+            },
+            detectFloorTarget: function(targetEl) {
+                var val = targetEl ? targetEl.value : '';
+                // 1. 检测 PHPWind 标准 [quote]...[/quote] 引用块
+                var quoteMatch = val.match(/^(\[quote\][\s\S]*?\[\/quote\]\s*)/i);
+                if (quoteMatch) {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: quoteMatch[1],
+                        targetUser: lastClickedFloor.user || '该层老哥',
+                        targetFloor: '',
+                        targetContent: quoteMatch[1].replace(/\[\/?quote\]/gi, '').trim()
+                    };
+                }
+                // 2. 检测草榴点击楼层“回复”自动填入的 "回 X 楼(xxx) 的帖子"
+                var replyFloorMatch = val.match(/^((?:回|Re:)\s*\d+\s*樓?\s*\(([^)]+)\)\s*的帖子\s*)/i);
+                if (replyFloorMatch) {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: replyFloorMatch[1].trim() + '\n',
+                        targetUser: replyFloorMatch[2],
+                        targetFloor: '',
+                        targetContent: lastClickedFloor.content || ('层主 ' + replyFloorMatch[2] + ' 的发言')
+                    };
+                }
+                if (lastClickedFloor.content && (Date.now() - lastClickedFloor.timestamp < 20000)) {
+                    return {
+                        isFloorReply: true,
+                        prefixToKeep: '',
+                        targetUser: lastClickedFloor.user || '该层老哥',
+                        targetFloor: '',
+                        targetContent: lastClickedFloor.content
+                    };
+                }
+                return null;
+            },
+            fillText: function(text, targetEl, prefixToKeep) {
+                var el = targetEl || document.querySelector('textarea[name="atc_content"]');
+                if (el) {
+                    fillControlledInput(el, (prefixToKeep || '') + text);
+                }
+            },
+            persona: '草榴社区(1024/t66y)资深老司机与常驻老哥，混迹于技术讨论区、达盖尔的旗帜、新时代的我们及影视资源区。说话豪爽、幽默、接地气、懂行，称呼发帖人为“楼主”或“老哥”，善用社区地道表达（如：1024、感谢老哥无私分享、好人一生平安、这身材顶不住、大作必须支持、老哥稳、经典永不过时等）。注意：草榴版规严禁纯发表情或单发一个“1024”灌水，回复必须结合帖子主题（看图夸身材/颜值/拍摄质感，看片夸画质/题材，看技术文学帖谈具体感受）写出自然真实的互动内容！'
+        },
         discuz: {
             match: function() { return true; },
             title: function() {
@@ -1078,13 +1189,13 @@
             type: 'short',
             maxTokens: 512,
             rulesForOP: [
-                '1. 你正在【直接回复楼主（主楼）】，这是纯水贴拿积分/思考/鸡腿模式，字数控制在 2~8 个字！',
-                '2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、太强了佬、思考一下、老哥稳、帮顶、bd、好鸡早收、分母来了）。',
+                '1. 你正在【直接回复楼主（主楼）】，这是简短水贴模式，字数控制在 4~10 个字（若在草榴社区，切勿只发纯数字1024，需带简短夸赞或感谢防封，如“1024 感谢老哥分享”、“极品好帖必须顶”）！',
+                '2. 根据主楼帖子类型和【前排网友回复】的队形，直接甩出最地道的社区极简用语（例如：感谢分享、1024老哥稳、太强了佬、思考一下、帮顶、bd、好鸡早收、分母来了）。',
                 '3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要包含 @用户名，只输出最终回复的那几个字！'
             ].join('\n'),
             rulesForFloor: [
                 '1. 你正在【直接回应某位层主】，字数控制在 2~10 个字！',
-                '2. 针对【你正在直接回应的层主发言】，用极简的一两个词附和、接梗、赞同或调侃他（例如：老哥真相了、确实如此、同感、扎心了、借您吉言、哈哈真实、+1）。',
+                '2. 针对【你正在直接回应的层主发言】，用极简的一两个词附和、接梗、赞同或调侃他（例如：老哥真相了、确实如此、同感、扎心了、借您吉言、哈哈真实、老司机懂行）。',
                 '3. 严禁出现“富哥”二字，严禁加句号，严禁换行，绝不要自己输出 @用户名（系统会自动加），只输出回复正文那几个字！'
             ].join('\n')
         },
@@ -1093,13 +1204,13 @@
             type: 'medium',
             maxTokens: 1024,
             rulesForOP: [
-                '1. 你正在【直接回复楼主（主楼）】，针对主楼内容，用一两句自然的大白话发表看法、吐槽、补充经验或互动。',
+                '1. 你正在【直接回复楼主（主楼）】，针对主楼标题、内容及前排评论氛围，用一两句自然的大白话发表看法、夸赞、吐槽或互动。',
                 '2. 字数控制在 25~55 个字左右（约一到两句话），必须把整句话的逻辑和意思表达完整，绝对不能话说到一半断掉！',
-                '3. 语气要像真人坛友日常敲字交流，口语化、接地气，严禁出现“富哥”、“总的来说”、“确实”、“希望”、“首先”等词。绝不要包含 @用户名，只输出回复正文！'
+                '3. 语气要像真人老哥日常敲字交流，口语化、接地气，严禁出现“富哥”、“总的来说”、“确实”、“希望”、“首先”等词。绝不要包含 @用户名，只输出回复正文！'
             ].join('\n'),
             rulesForFloor: [
                 '1. 你正在【直接与某位层主对话/对线】！请把注意力 100% 集中在【你正在直接回应的层主发言】上（主楼内容仅作背景参考）。',
-                '2. 顺着这位层主的话进行回应（赞同补充、解答他的疑问、反驳他的观点或顺着吐槽），字数控制在 20~50 个字左右，必须把话完整说完，绝不断句！',
+                '2. 顺着这位层主的话进行回应（赞同补充、解答他的疑问、反驳他的观点或顺着接梗），字数控制在 20~50 个字左右，必须把话完整说完，绝不断句！',
                 '3. 语气要像真人坛友在楼层里直接跟人搭话，自然口语化，严禁出现“富哥”二字，严禁在开头自己写 @用户名（系统已自带前缀），只输出纯回复正文！'
             ].join('\n')
         },
@@ -1108,13 +1219,13 @@
             type: 'long',
             maxTokens: 2048,
             rulesForOP: [
-                '1. 你正在【直接回复楼主（主楼）】，针对主楼的问题、方案、教程或分享，给出有深度、有干货、逻辑完整的详细分析或解答，字数控制在 120~350 字左右，务必把前因后果、排查步骤或优缺点完整讲透，严禁半途截断！',
-                '2. 保持论坛资深技术老哥的口吻：直接切入核心痛点或细节，可以自然分段，但严禁使用“富哥”、“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种套话。',
+                '1. 你正在【直接回复楼主（主楼）】，针对主楼的主题、分享、故事或技术讨论，给出有细节、走心、逻辑完整的详细点评或解答，字数控制在 100~300 字左右，务必把话完整讲透，严禁半途截断！',
+                '2. 保持论坛资深老哥的口吻：直接切入核心看点或细节，可以自然分段，但严禁使用“富哥”、“首先、其次、最后、综上所述、总而言之、希望能帮到你”这种死板套话。',
                 '3. 纯文本输出：绝对不要使用 Markdown 加粗符号（**）或标题符号（###），只输出回复正文！'
             ].join('\n'),
             rulesForFloor: [
-                '1. 你正在【深度回应/解答某位层主的观点或追问】！请重点针对【你正在直接回应的层主发言】展开深度分析、技术探讨、细节补充或有理有据的反驳，结合主楼背景把道理讲透，字数控制在 100~300 字左右，严禁半途截断！',
-                '2. 保持论坛资深技术老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“富哥”、“首先、其次、最后、综上所述”等套话，也不要使用 Markdown 加粗符号（**）。',
+                '1. 你正在【深度回应/探讨某位层主的观点】！请重点针对【你正在直接回应的层主发言】展开走心交流、细节补充或探讨，结合主楼背景把话讲透，字数控制在 100~280 字左右，严禁半途截断！',
+                '2. 保持论坛资深老哥与坛友切磋交流的口吻，直接切入要点，严禁使用“富哥”、“首先、其次、最后、综上所述”等套话，也不要使用 Markdown 加粗符号（**）。',
                 '3. 严禁在开头自己输出 @用户名（系统已保留前缀），只输出纯回复正文！'
             ].join('\n')
         }
@@ -1124,6 +1235,7 @@
         if (siteConfigs.v2ex.match()) return siteConfigs.v2ex;
         if (siteConfigs.linuxdo.match()) return siteConfigs.linuxdo;
         if (siteConfigs.nodeseek.match()) return siteConfigs.nodeseek;
+        if (siteConfigs.t66y.match()) return siteConfigs.t66y;
         return siteConfigs.discuz;
     }
 
@@ -1173,7 +1285,7 @@
                 badge.className = 'gemini-target-badge';
                 badge._boundTarget = target;
                 badge.innerText = '📢 当前：回楼主';
-                badge.title = '当输入框内有 @用户名 #楼层 或在回复小窗中时，自动切换为针对层主发言生成回复';
+                badge.title = '当输入框内有 @用户名 #楼层 或引用块时，自动切换为针对层主发言生成回复';
                 badge.style.cssText = 'padding:3px 8px;background:#1e1f22;color:#949ba4;border:1px solid #4e5058;border-radius:4px;font-size:12px;line-height:1.4;user-select:none;';
                 bar.appendChild(badge);
 
@@ -1278,7 +1390,7 @@
         var title = site.title() || '无标题';
         var contentLimit = mode.type === 'long' ? 2500 : 1000;
         var content = (site.content() || '无正文内容').slice(0, contentLimit);
-        var replies = (site.replies() || '暂无回复').slice(0, 500);
+        var replies = (site.replies() || '暂无回复').slice(0, 600);
         var personaText = typeof site.persona === 'function' ? site.persona() : site.persona;
 
         var floorInfo = site.detectFloorTarget ? site.detectFloorTarget(targetEl) : null;
