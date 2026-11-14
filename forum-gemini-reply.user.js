@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         论坛 Gemini 智能回帖助手 (V2EX / NodeSeek / Linux.do / 草榴 / Discuz)
 // @namespace    https://github.com/kylo1989/forum-gemini-reply
-// @version      4.1.0
-// @description  彻底攻克草榴(t66y) PROHIBITED_CONTENT 拦截(前置敏感词清洗+二级脱敏自动重试) + 全面适配 V2EX/Linux.do/NodeSeek 摸鱼与原生模式 + 429自动负载均衡
+// @version      4.2.0
+// @description  新增“自动负载 / 手动锁定”双模式开关(手动选定模型不再被强制切走) + 草榴(t66y)防拦截 + V2EX/Linux.do/NodeSeek摸鱼与原生适配 + 恩山等DZ论坛
 // @author       kylo1989
 // @license      MIT
 // @homepageURL  https://github.com/kylo1989/forum-gemini-reply
@@ -55,6 +55,14 @@
         fetchOfficialModels(true, true);
     });
 
+    GM_registerMenuCommand('🔀 3. 切换模型策略 (自动负载 / 手动锁定)', function() {
+        var currentAuto = GM_getValue('GEMINI_AUTO_FALLBACK', true);
+        var nextState = !currentAuto;
+        GM_setValue('GEMINI_AUTO_FALLBACK', nextState);
+        syncAllFailoverToggles();
+        showToast(nextState ? '🔀 已切换为【自动负载模式】：额度超限自动切备用模型' : '🔒 已切换为【手动锁定模式】：严格只使用当前选定模型', false);
+    });
+
     function showToast(msg, isError) {
         var toast = document.createElement('div');
         toast.innerText = msg;
@@ -70,17 +78,14 @@
 
     /**
      * 核心防拦截清洗器：消除会触发 Google Gemini PROHIBITED_CONTENT 硬性网关拦截的高危词
-     * 将成人/敏感字眼转化为安全的摄影/艺术鉴赏词汇，让模型正常理解语境并输出地道回复
      */
     function sanitizeSensitiveText(rawText) {
         if (!rawText) return '';
         var s = rawText;
-        // 1. 剔除磁力链、哈希特征码和网址（往往被 Google 标记为盗版/违禁特征码）
         s = s.replace(/magnet:\?xt=urn:btih:[a-zA-Z0-9]+/gi, '[资源链接]');
         s = s.replace(/[a-fA-F0-9]{32,40}/g, '[特征码]');
         s = s.replace(/https?:\/\/[^\s]+/gi, '');
 
-        // 2. 替换绝对红线词（未成年/非自愿/乱伦等会100%触发 PROHIBITED_CONTENT 的字眼）
         var redlineRules = [
             [/萝莉|幼女|童颜|未成年|小学生|初中生|高中生|学生妹|校花|学妹|少女|嫩妹/g, '年轻模特'],
             [/强奸|迷奸|轮奸|强暴|强推|下药|迷晕|醉酒|灌醉|强上|硬上|侵犯/g, '对手戏'],
@@ -424,12 +429,12 @@
 
     function annotateModel(modelId) {
         var id = modelId.toLowerCase();
-        if (id === 'gemini-2.0-flash') return { label: '⚡ ' + modelId + ' (主力推荐·高额度秒回)', priority: 100 };
+        if (id === 'gemini-2.0-flash') return { label: '⚡ ' + modelId + ' (主力推荐·每日1500次高额度)', priority: 100 };
         if (id === 'gemini-2.5-flash-lite' || id.indexOf('gemini-2.5-flash-lite-') === 0) return { label: '🚀 ' + modelId + ' (2.5极速轻量·高额度推荐)', priority: 96 };
         if (id === 'gemini-2.0-flash-lite' || id.indexOf('gemini-2.0-flash-lite-') === 0) return { label: '💨 ' + modelId + ' (2.0超轻量·高额度极速)', priority: 92 };
         if (id === 'gemini-1.5-flash' || id === 'gemini-1.5-flash-latest') return { label: '🛡️ ' + modelId + ' (经典稳定·高额度备用)', priority: 88 };
         if (id.indexOf('1.5-flash-8b') !== -1) return { label: '🍃 ' + modelId + ' (8B超轻量·高频防限流)', priority: 84 };
-        if (id === 'gemini-2.5-flash') return { label: '🧠 ' + modelId + ' (2.5标准版·免费额度严苛)', priority: 55 };
+        if (id === 'gemini-2.5-flash') return { label: '🧠 ' + modelId + ' (2.5标准版·免费额度仅20次/天)', priority: 55 };
 
         if (id.indexOf('flash-lite') !== -1) return { label: '🚀 ' + modelId + ' (轻量Flash·高额度极速)', priority: 90 };
         if (id.indexOf('flash') !== -1 && id.indexOf('exp') === -1 && id.indexOf('preview') === -1 && id.indexOf('thinking') === -1) {
@@ -554,6 +559,30 @@
                 selectEl.appendChild(opt);
             }
             selectEl.value = currentSaved;
+        }
+    }
+
+    /**
+     * 同步页面上所有“自动负载 / 手动锁定”切换按钮的视觉状态
+     */
+    function syncAllFailoverToggles() {
+        var isAuto = GM_getValue('GEMINI_AUTO_FALLBACK', true);
+        var toggles = document.querySelectorAll('.gemini-failover-toggle');
+        for (var i = 0; i < toggles.length; i++) {
+            var btn = toggles[i];
+            if (isAuto) {
+                btn.innerText = '🔀 自动负载';
+                btn.title = '当前为【自动负载模式】：若所选模型额度用尽(429)或报错，自动顺延切换到其他可用模型。\n点击可切换为【手动锁定模式】';
+                btn.style.background = '#1e3a5f';
+                btn.style.color = '#93c5fd';
+                btn.style.borderColor = '#2563eb';
+            } else {
+                btn.innerText = '🔒 手动锁定';
+                btn.title = '当前为【手动锁定模式】：严格只使用右侧选定的模型，绝不自动切换。\n点击可切换为【自动负载模式】';
+                btn.style.background = '#3f2e1d';
+                btn.style.color = '#fcd34d';
+                btn.style.borderColor = '#d97706';
+            }
         }
     }
 
@@ -1119,7 +1148,6 @@
                     fillControlledInput(el, (prefixToKeep || '') + text);
                 }
             },
-            // 脱敏版老哥人设：避开 Google 对 "草榴/成人/色情" 等站点名关键词的硬性网关封杀，同时完美保留 1024 老哥的说话精髓
             persona: '综合摄影、影视资源与生活讨论社区的资深老哥，说话豪爽、幽默、接地气，称呼发帖人为“楼主”或“老哥”，善用社区地道口头禅（如：1024、感谢老哥无私分享、好人一生平安、这身材和颜值真顶不住、大作必须支持、老哥稳、经典佳作等）。注意：切勿只单发一个数字1024，必须结合帖子的主题（若是写真摄影则夸赞模特身材比例、颜值气质或拍摄质感；若是影视分享则夸赞画质清晰度、题材给力；若是日常文学或技术讨论则谈真实感受）写出自然且健康的坛友互动内容！'
         },
         discuz: {
@@ -1326,13 +1354,33 @@
                     })(replyModes[m]);
                 }
 
+                // 新增：自动负载 / 手动锁定 切换按钮
+                var failoverToggleBtn = document.createElement('button');
+                failoverToggleBtn.className = 'gemini-failover-toggle';
+                failoverToggleBtn.type = 'button';
+                failoverToggleBtn.style.cssText = 'padding:3px 8px;border:1px solid #2563eb;border-radius:4px;cursor:pointer;font-size:12px;line-height:1.4;transition:0.2s;';
+                failoverToggleBtn.onclick = function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var currentAuto = GM_getValue('GEMINI_AUTO_FALLBACK', true);
+                    var nextState = !currentAuto;
+                    GM_setValue('GEMINI_AUTO_FALLBACK', nextState);
+                    syncAllFailoverToggles();
+                    showToast(nextState ? '🔀 已开启【自动负载】：模型超限自动切备用' : '🔒 已开启【手动锁定】：固定使用选定模型', false);
+                };
+                bar.appendChild(failoverToggleBtn);
+
                 var modelSelect = document.createElement('select');
                 modelSelect.className = 'gemini-model-select';
-                modelSelect.title = '选择 Gemini 模型（列表通过官方 API 自动更新，支持额度耗尽自动切换）';
-                modelSelect.style.cssText = 'padding:3px 6px;background:#1e1f22;color:#b5bac1;border:1px solid #4e5058;border-radius:4px;font-size:12px;height:26px;cursor:pointer;outline:none;max-width:250px;';
+                modelSelect.title = '选择 Gemini 模型（手动切换模型时自动锁定该模型，如需自动负载可点击左侧切换按钮）';
+                modelSelect.style.cssText = 'padding:3px 6px;background:#1e1f22;color:#b5bac1;border:1px solid #4e5058;border-radius:4px;font-size:12px;height:26px;cursor:pointer;outline:none;max-width:240px;';
                 modelSelect.onchange = function() {
                     GM_setValue('GEMINI_MODEL', modelSelect.value);
+                    // 用户主动在下拉框手动选定模型时，自动切为【手动锁定】防止被负载切走
+                    GM_setValue('GEMINI_AUTO_FALLBACK', false);
                     syncAllModelSelects();
+                    syncAllFailoverToggles();
+                    showToast('🔒 已手动锁定模型：' + modelSelect.value, false);
                 };
                 bar.appendChild(modelSelect);
 
@@ -1369,6 +1417,7 @@
 
         if (mountedNew) {
             syncAllModelSelects();
+            syncAllFailoverToggles();
             fetchOfficialModels(false, false);
         }
         updateModeBarStatus();
@@ -1397,16 +1446,14 @@
         return null;
     }
 
-    /**
-     * 核心生成函数
-     * @param {Boolean} isSafeRetry 当遇到 PROHIBITED_CONTENT 拦截时，自动启动深度脱敏模式重试一次
-     */
     function generateReply(site, mode, btn, targetEl, modelId, triedModels, isSafeRetry) {
         var apiKey = GM_getValue('GEMINI_API_KEY', '');
         if (!apiKey) {
             alert('请先点击浏览器右上角油猴插件图标 -> 点击【🔑 1. 设置 Gemini API Key】');
             return;
         }
+
+        var isAutoFallback = GM_getValue('GEMINI_AUTO_FALLBACK', true);
 
         if (!isSafeRetry && triedModels.indexOf(modelId) === -1) {
             triedModels.push(modelId);
@@ -1418,13 +1465,11 @@
         var rawReplies = (site.replies() || '暂无回复').slice(0, 600);
         var personaText = typeof site.persona === 'function' ? site.persona() : site.persona;
 
-        // 如果处于草榴社区或触发了安全重试，对所有输入文本执行深度敏感词脱敏
         var shouldSanitize = isT66ySite() || isSafeRetry;
         var title = shouldSanitize ? sanitizeSensitiveText(rawTitle) : rawTitle;
         var content = shouldSanitize ? sanitizeSensitiveText(rawContent) : rawContent;
         var replies = shouldSanitize ? sanitizeSensitiveText(rawReplies) : rawReplies;
 
-        // 如果是 PROHIBITED_CONTENT 触发的二级深度脱敏重试：剥离可能含有隐晦违规描写的长正文，仅使用清洗后的标题和纯安全语境生成
         if (isSafeRetry) {
             content = '（这是一篇网友分享的高清摄影作品与生活交流帖，请直接围绕标题氛围和感谢楼主分享进行热情回复）';
         }
@@ -1500,7 +1545,8 @@
 
                     if (data.error) {
                         var errCode = data.error.code;
-                        if (errCode === 429 || errCode === 404 || errCode === 503 || errCode === 400) {
+                        // 仅当开启了【🔀 自动负载】模式时，才在遇到 429/404/503/400 时自动顺延切换其他模型
+                        if (isAutoFallback && (errCode === 429 || errCode === 404 || errCode === 503 || errCode === 400)) {
                             var nextModel = getNextAvailableModel(triedModels);
                             if (nextModel && triedModels.length <= 4) {
                                 console.warn('[Gemini负载均衡] 模型 ' + modelId + ' 不可用 (Code ' + errCode + ')，自动切换至备用模型: ' + nextModel);
@@ -1512,11 +1558,11 @@
                         }
                         btn.innerText = btn.dataset.origText;
                         btn.disabled = false;
-                        alert('Gemini API 报错 (' + data.error.code + ') [已尝试模型: ' + triedModels.join(' -> ') + ']:\n' + data.error.message);
+                        var modeHint = isAutoFallback ? '（自动负载已尝试全部候选模型均不可用）' : '（当前处于【🔒 手动锁定】模式，未自动切换其他模型；如需自动切换请点击左侧切换为【🔀 自动负载】）';
+                        alert('Gemini API 报错 (' + data.error.code + ') [模型: ' + modelId + ']:\n' + data.error.message + '\n\n' + modeHint);
                         return;
                     }
 
-                    // 核心防拦截机制：如果遇到 PROHIBITED_CONTENT 或 SAFETY 拦截，自动启动二级深度脱敏重试一次
                     var blockReason = (data.promptFeedback && data.promptFeedback.blockReason) ||
                                       (data.candidates && data.candidates[0] && (data.candidates[0].finishReason === 'PROHIBITED_CONTENT' || data.candidates[0].finishReason === 'SAFETY' || data.candidates[0].finishReason === 'BLOCKLIST') ? data.candidates[0].finishReason : '');
 
